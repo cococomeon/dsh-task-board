@@ -1,0 +1,10 @@
+packages:
+  - .
+
+# Same shape as the DSH web profile this fork is linked into: one flat
+# node_modules, and no peer resolution — the SDK peers (@deepseek-ai/dsh*,
+# react) are supplied by DSH at load time, never installed here.
+nodeLinker: hoisted
+autoInstallPeers: false
+allowBuilds:
+  esbuild: true
