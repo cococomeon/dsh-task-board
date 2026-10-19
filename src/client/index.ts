@@ -24,12 +24,13 @@ import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 // Type-only: pulls the workspace plugin's Context merge (ctx.uiWorkspace), the
 // multi-instance navigation face that replaced ISessions.open().
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
-import { BoardController, TASK_BOARD_PANEL_ID } from '../core/controller.ts'
+import { BoardController, TASK_BOARD_PANEL_ID, type SessionsControllerFace } from '../core/controller.ts'
 import { collectSessionRuntimeStates, type SessionRuntimeFacts } from '../core/session-state.ts'
 import { mainViewSessionId } from './main-session.ts'
 import { LocalStorageTaskStore } from '../core/store.ts'
 import { claimTaskboardApply, releaseTaskboardApply } from './apply-guard.ts'
 import { registerTaskBoardPanel } from './native-panel.tsx'
+import { registerSessionBoardLink } from './SessionBoardLink.tsx'
 import { TaskBoardSettingsCard, TaskBoardSettingsCardController, type TaskBoardSettings } from './TaskBoardSettingsCard.tsx'
 import { en, zh, setRuntimeTranslate, type TaskBoardKey } from './locales.ts'
 import { HttpTaskBoardHostTransport } from './host-api.ts'
@@ -260,6 +261,16 @@ export function apply(ctx: ClientContext): void {
 
     // Core wiring: real runtime faces into the framework-free services.
     const store = new LocalStorageTaskStore()
+    // One session face, shared by the controller and the title-bar button, so
+    // "which session is the main view on" is derived in exactly one place.
+    const sessionFace: SessionsControllerFace = {
+      // The main-view Session comes from the catalog's per-source ownership
+      // counts; navigation belongs to the workspace UI since the
+      // multi-instance Client Session model.
+      current: () => mainViewSessionId(sessions.list.getSnapshot().byId),
+      open: id => ctx.uiWorkspace.openSession(id as never),
+      subscribe: fn => sessions.list.subscribe(fn),
+    }
     const controller = new BoardController({
       store,
       transport: new HttpTaskBoardHostTransport(),
@@ -275,14 +286,7 @@ export function apply(ctx: ClientContext): void {
           layout?.selectPanel?.(panelId)
         },
       },
-      sessions: {
-        // The main-view Session comes from the catalog's per-source ownership
-        // counts; navigation belongs to the workspace UI since the
-        // multi-instance Client Session model.
-        current: () => mainViewSessionId(sessions.list.getSnapshot().byId),
-        open: id => ctx.uiWorkspace.openSession(id as never),
-        subscribe: fn => sessions.list.subscribe(fn),
-      },
+      sessions: sessionFace,
     })
     controller.start()
     // The extension service follows the live controller: providers observe the
@@ -456,6 +460,16 @@ export function apply(ctx: ClientContext): void {
     } catch (error) {
       // A shell that cannot serve the seats degrades the board, never the GUI.
       console.error('[dsh-task-board] panel registration failed:', error)
+    }
+
+    // The reverse link: one button in the conversation title bar that opens the
+    // board on the card this session is associated with. Registered separately
+    // from the panel above so a header-less shell cannot cost the board its
+    // sidebar row.
+    try {
+      disposers.push(registerSessionBoardLink(ctx, { controller, sessions: sessionFace }))
+    } catch (error) {
+      console.error('[dsh-task-board] session link registration failed:', error)
     }
 
     uiDisposer = () => {

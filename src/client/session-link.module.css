@@ -1,0 +1,131 @@
+/* The session-title-bar entry point into the board: one icon button and the
+ * picker it opens when the session has more than one associated card.
+ *
+ * The button sits in the conversation header's own actions row, so it keeps that
+ * row's 28px icon scale and hover wash instead of the board's chunky control
+ * recipe — a settings-card control here would read as a foreign element in the
+ * title bar. It carries one hairline the row's other buttons do not, because a
+ * title-bar icon with no permanent affordance is not findable at rest, and its
+ * disabled state used to resolve to the dimmed token, which is near-white on a
+ * light theme. */
+
+.root {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.button {
+  appearance: none;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--dsw-alias-border-l3);
+  border-radius: 6px;
+  background: transparent;
+  /* Secondary, not tertiary: at rest the icon must read as a control, and the
+   * disabled variant below drops only one step instead of vanishing. */
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+
+.button:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  border-color: var(--dsw-alias-border-l2);
+  color: var(--dsw-alias-label-primary);
+}
+
+.button:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary);
+  outline-offset: 1px;
+}
+
+/* Disabled stays focusable (aria-disabled, not the disabled attribute): a
+ * keyboard user must still land on it and read the tooltip, because "no linked
+ * card yet" is information, not an absence. Tertiary keeps ~3.7:1 against the
+ * light header, whereas the dimmed token it used to take is ~1.2:1. */
+.buttonDisabled {
+  color: var(--dsw-alias-label-tertiary);
+  cursor: default;
+}
+
+.buttonDisabled:hover {
+  background: transparent;
+  border-color: var(--dsw-alias-border-l3);
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  min-width: 240px;
+  max-width: 320px;
+  max-height: 320px;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  overflow-y: auto;
+  background: var(--dsw-alias-bg-base);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  box-shadow: var(--dsw-shadow-lv2);
+}
+
+.item {
+  appearance: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  padding: 7px 9px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.item:hover,
+.item:focus-visible {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.item:focus-visible {
+  outline: none;
+}
+
+.itemTitle {
+  overflow: hidden;
+  font-size: 13px;
+  line-height: 18px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--dsw-alias-label-caption);
+  font-size: 11px;
+  line-height: 15px;
+}
+
+/* One badge per association reason; both render when both hold, which is the
+ * case the picker exists to disambiguate. */
+.reason {
+  padding: 0 5px;
+  border: 1px solid var(--dsw-alias-border-l3);
+  border-radius: 5px;
+}
