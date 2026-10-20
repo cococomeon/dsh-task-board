@@ -3,11 +3,11 @@ import type { Workspace } from '@deepseek-ai/dsh-workspace/types'
 import { DEFAULT_SESSION_POLL_SECONDS, normalizeSessionPollSeconds, sessionPollMs } from './core/poll-cadence.ts'
 import { reusableSessionId } from './core/session-reuse.ts'
 import { HostTaskLedger, type OpenedRun, type OpenExecutionReference } from './host-ledger.ts'
-import { HostExecutionRunner, SessionLaunchError, promptText, type SessionCommandDispatcher, type SessionSummary, type TaskBoardWorkspaceRegistry } from './host-runner.ts'
+import { HostExecutionRunner, SessionLaunchError, promptText, type SessionCommandDispatcher, type SessionSummary, type TaskBoardWorkspaceGate, type TaskBoardWorkspaceRegistry, type TaskBoardWorkspaceGuard } from './host-runner.ts'
 import { teammateName } from './core/subtask.ts'
 import { mostRecentWorkspaceId, workspaceOwningSession } from './core/workspace-target.ts'
 import { PowerInhibitor } from './power-inhibitor.ts'
-import { TASK_BOARD_SCHEMA_VERSION, type TaskBoardAction, type TaskBoardEventPayload, type TaskBoardSnapshot } from './protocol.ts'
+import { TASK_BOARD_SCHEMA_VERSION, type TaskBoardAction, type TaskBoardBindingPrompt, type TaskBoardEventPayload, type TaskBoardSnapshot } from './protocol.ts'
 import { TaskBoardExtensionRegistry } from './host/extension-registry.ts'
 import type { TaskBoardExtension } from './core/extension.ts'
 import { canVerifyTask, hasOpenExecution, type ExecutionOutcome, type ScheduleMode, type TaskRecord, type TaskStatus } from './core/tasks.ts'
@@ -216,6 +216,8 @@ export class TaskBoardHostService {
    */
   private readonly gitRemote: () => string
   private lastPowerJson = ''
+  /** Reader of the turns currently blocked on a binding question (see setBindingSource). */
+  private bindingSource: () => readonly TaskBoardBindingPrompt[] = () => []
   private readonly now: () => number
   /** The deployment's workspaces, consulted to resolve a card that pins none. */
   private readonly workspaceRegistry: TaskBoardWorkspaceRegistry | undefined
@@ -232,6 +234,11 @@ export class TaskBoardHostService {
     now?: () => number
     commandDispatcher?: SessionCommandDispatcher
     workspaceRegistry?: TaskBoardWorkspaceRegistry
+    /**
+     * Optional pre-run workspace gate. Absent (the default) leaves the board's
+     * own behaviour: a launch only checks that the named workspace exists.
+     */
+    workspaceGate?: TaskBoardWorkspaceGate
     /**
      * Permission baseline of the confirmation gate: a fixed value, or a live
      * resolver the board re-reads so a Host Settings change needs no remount.
@@ -266,7 +273,17 @@ export class TaskBoardHostService {
       sessionDefaultPermission: options.sessionDefaultPermission,
       maxSubtaskDepth: options.maxSubtaskDepth,
     })
-    this.runner = new HostExecutionRunner(gateway, options.commandDispatcher, options.workspaceRegistry)
+    // The gate decides, the board writes: a workspace chosen for a card that
+    // pinned none is recorded through this ledger, never by the gate itself.
+    const workspaceGuard: TaskBoardWorkspaceGuard | undefined = options.workspaceGate === undefined ? undefined : {
+      gate: options.workspaceGate,
+      record: (taskId: string, workspaceId: string): void => {
+        const task = this.ledger.getTask(taskId)
+        if (task === undefined) return
+        this.ledger.saveTaskRecord({ ...task, workspaceId })
+      },
+    }
+    this.runner = new HostExecutionRunner(gateway, options.commandDispatcher, options.workspaceRegistry, undefined, workspaceGuard)
     this.workspaceRegistry = options.workspaceRegistry
     this.team = options.team
     this.timers = options.timers ?? PROCESS_TIMERS
@@ -415,7 +432,45 @@ export class TaskBoardHostService {
   /** SSE frame payload; deliberately skips the tasks deep-clone of {@link snapshot}. */
   eventPayload(): TaskBoardEventPayload {
     const { revision, scheduler } = this.ledger.summary()
-    return { revision, scheduler, power: this.power.snapshot() }
+    return {
+      revision,
+      scheduler,
+      power: this.power.snapshot(),
+      // Always present, even when empty: the browser distinguishes "no turn is
+      // waiting" from "this frame cannot say" by presence, and an omitted array
+      // would leave a stale modal painted after the answer already arrived.
+      binding: this.bindingSource(),
+    }
+  }
+
+  /**
+   * Number of browsers currently subscribed to the event stream.
+   *
+   * The turn binder asks this before it blocks: with no subscriber there is no
+   * surface that could draw the modal, so waiting for an answer would only
+   * delay the turn. It counts the live SSE connections of this board — the same
+   * set {@link emit} pushes to.
+   */
+  subscriberCount(): number {
+    return this.listeners.size
+  }
+
+  /**
+   * Install the reader of the turns currently blocked on a binding question
+   * (the session binder). A board that never installs one reports no prompts,
+   * which is exactly the behaviour before binding existed.
+   */
+  setBindingSource(source: () => readonly TaskBoardBindingPrompt[]): void {
+    this.bindingSource = source
+  }
+
+  /**
+   * Push a frame now. The binder calls this when a question appears and when it
+   * goes away, so the modal opens and closes without waiting for a ledger
+   * change (the ledger is untouched until the answer arrives).
+   */
+  refreshEvents(): void {
+    this.emit()
   }
 
   subscribe(listener: () => void): () => void {

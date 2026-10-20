@@ -16,6 +16,7 @@ import type {} from '@deepseek-ai/dsh-workspace'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
+import type { TaskBoardWorkspaceGate } from './host-runner.ts'
 import type { LlmRuntime } from '@deepseek-ai/dsh-llm'
 import { DEFAULT_GIT_REMOTE, TaskBoardHostService, type HostTimerFace, type TaskBoardTeamDispatcher } from './host-service.ts'
 import { parseTaskDraft, TaskParseError } from './host-ai.ts'
@@ -33,7 +34,9 @@ import {
   verificationCallTimeoutMs,
 } from './core/verification-budget.ts'
 import { DEFAULT_SESSION_PERMISSION } from './core/handover.ts'
-import { buildTaskBoardTools, TASK_BOARD_TOOL_NAMES } from './host/agent-tools.ts'
+import { buildTaskBoardTools, callingSessionId, TASK_BOARD_TOOL_NAMES } from './host/agent-tools.ts'
+import { SessionBinder } from './host/session-binder.ts'
+import { SessionChoiceStore } from './host/session-choice.ts'
 import { PLUGIN_TOOL_SECTION_ORDERS, visibleToolText } from './tool-surface.ts'
 import { makeTaskBoardRoutes } from './host-routes.ts'
 import { TASK_BOARD_SERVICE_NAME, type TaskBoardExtension } from './core/extension.ts'
@@ -41,6 +44,19 @@ import { mountOnce } from './mount-once.ts'
 import { createGoalVerificationGate, type GoalFace } from './host/verification-gate.ts'
 import { normalizeCatalog, type ModelCatalogView, type VerificationSettings } from './core/verification.ts'
 import { probeWorkspaceChanges } from './host/workspace-evidence.ts'
+
+/**
+ * Log one warn line through the host logger when this context serves one.
+ *
+ * The binding hooks run inside the agent loop, where an unlogged throw would
+ * only reach the turn's own error path; a failed binding step must be visible
+ * as a plugin problem instead.
+ */
+function warn(ctx: Context, message: string, ...rest: unknown[]): void {
+  const logger = (ctx as { logger?: { warn?: (...args: unknown[]) => void } }).logger
+  if (typeof logger?.warn === 'function') logger.warn(message, ...rest)
+  else console.warn(message, ...rest)
+}
 
 /** Order of the announcement section within the shared tool-guidance band. */
 const SECTION_ORDER = PLUGIN_TOOL_SECTION_ORDERS['task-board']
@@ -326,6 +342,29 @@ function lookupOf(registry: AgentToolRegistry | undefined): { get: (name: string
 }
 
 /**
+ * Resolve the optional pre-run workspace gate.
+ *
+ * Deliberately not injected, exactly like the tool registry: a deployment with
+ * no guard plugin must still mount the whole board and simply keep its own
+ * behaviour (a launch checks that the named workspace exists and nothing more).
+ * The service is resolved per launch by the Host face that consumes it, so a
+ * guard row that mounts after the board is still picked up.
+ *
+ * @param ctx - the plugin context.
+ * @returns the gate, or undefined when no guard plugin is installed.
+ */
+export function resolveWorkspaceGate(ctx: Context): TaskBoardWorkspaceGate | undefined {
+  try {
+    const guard = ctx.get('workspaceGuard') as { prepare?: unknown } | undefined
+    return guard !== undefined && typeof guard.prepare === 'function'
+      ? guard as TaskBoardWorkspaceGate
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Resolve the optional agent-tool registry. The board deliberately does not
  * inject it: a deployment whose runtime serves no registry must still mount the
  * whole board and lose only the agent-tool surface, the same tolerance the
@@ -551,6 +590,7 @@ function applyImpl(ctx: Context, config?: Config): void {
   const gitRemote = (): string => readConfigField(config?.gitRemote, DEFAULT_GIT_REMOTE)
   const host = new TaskBoardHostService(ctx.typertGateway, {
     workspaceRegistry: ctx.workspaceRegistry,
+    workspaceGate: resolveWorkspaceGate(ctx),
     sessionDefaultPermission,
     maxSubtaskDepth: maxSubtaskDepth(),
     goalRunEnabled,
@@ -673,12 +713,70 @@ function applyImpl(ctx: Context, config?: Config): void {
         const handle = offGate as { dispose(): void }
         disposers.push(() => { handle.dispose() })
       }
+      // Turn -> card binding. Every question asked in a session first pulls
+      // that session's card back into the running column, and the turn's own
+      // ending settles it again.
+      const binder = new SessionBinder({
+        ledger: host.ledger,
+        choices: new SessionChoiceStore(),
+        // Without a subscriber nobody could draw the modal, so the binder must
+        // not wait at all (see SessionBinder's module doc).
+        hasSubscribers: () => host.subscriberCount() > 0,
+        publish: () => { host.refreshEvents() },
+        warn: (message, ...rest) => { warn(ctx, message, ...rest) },
+      })
+      host.setBindingSource(() => binder.pendingPrompts())
+      disposers.push(() => { binder.dispose() })
+      // `agent/pre-step` is the only cancellable place BEFORE the model call:
+      // it is a waterfall the loop awaits for every step, so awaiting inside it
+      // holds the turn open. Steps are 1-based, so the binder binds on step 1.
+      const offPreStep = ctx.on('agent/pre-step', async (payload, next) => {
+        try {
+          // A disabled board answers no tool call either; binding work for it
+          // would be a write nobody asked for.
+          if (enabled()) {
+            const sessionId = callingSessionId(payload)
+            if (sessionId !== undefined) {
+              await binder.beforeTurn(sessionId, payload.turn, payload.step, payload.signal)
+            }
+          }
+        } catch (error) {
+          // Binding must never cost a turn: the failure is logged and the turn
+          // proceeds exactly as it would without the plugin.
+          warn(ctx, 'task-board: session binding failed before the step', error)
+        }
+        return await next()
+      })
+      if (typeof offPreStep === 'function') disposers.push(offPreStep)
+      else if (typeof (offPreStep as { dispose?: unknown } | undefined)?.dispose === 'function') {
+        const handle = offPreStep as { dispose(): void }
+        disposers.push(() => { handle.dispose() })
+      }
+      // `turn/end` is not itself a lifecycle hook — it is a session log event,
+      // and every log append is published here. It is not interceptable, and the
+      // settlement does not need to be: the turn is already over.
+      const offTurnEnd = ctx.on('session/event', (session, event) => {
+        if (event?.type !== 'turn/end') return
+        try {
+          const sessionId = callingSessionId({ agent: { session } })
+          if (sessionId === undefined) return
+          binder.afterTurn(sessionId, event.turn, event.reason)
+        } catch (error) {
+          warn(ctx, 'task-board: session binding could not settle the turn', error)
+        }
+      })
+      if (typeof offTurnEnd === 'function') disposers.push(offTurnEnd)
+      else if (typeof (offTurnEnd as { dispose?: unknown } | undefined)?.dispose === 'function') {
+        const handle = offTurnEnd as { dispose(): void }
+        disposers.push(() => { handle.dispose() })
+      }
       const routes = makeTaskBoardRoutes(host, resolveProxyAccess(config), {
         parseTask: async (request, signal) => {
           const llm = resolveLlmRuntime(ctx)
           if (llm === undefined) throw new TaskParseError('no-model', 'this deployment serves no llm service')
           return await parseTaskDraft(llm, request, signal)
         },
+        bindChoice: choice => binder.resolveChoice(choice.sessionId, choice.taskId),
       })
       for (const route of routes) disposers.push(ctx.webServer.register(route))
     } catch (error) {

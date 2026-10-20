@@ -312,6 +312,60 @@ function invokeWireArgs(namespace: string, method: string, request: Record<strin
   return { request }
 }
 
+/**
+ * One launch's workspace decision, handed to an optional pre-run gate.
+ *
+ * The card identifies itself by content rather than by record, so a gate can
+ * classify the work (an AFA task, a CMC task, anything else) without importing
+ * the board's ledger types.
+ */
+export interface TaskBoardWorkspaceGateRequest {
+  /** Card the launch belongs to. */
+  readonly taskId: string
+  /** Card title, as written by whoever created it. */
+  readonly title: string
+  /** Card prompt, the full instruction the run will carry. */
+  readonly prompt: string
+  /** The workspace the board resolved for this run, when it resolved one. */
+  readonly workspaceId?: string
+  /**
+   * Record a gate-chosen workspace on the card. The gate decides and the board
+   * persists — the gate never touches board state itself.
+   * @param workspaceId - the workspace the run must use.
+   */
+  readonly record: (workspaceId: string) => void
+}
+
+/**
+ * A pre-run workspace gate: an optional judge the board asks once per launch.
+ *
+ * The board has no concept of a workspace being occupied, dirty, or shared, so
+ * it cannot answer "may this task run here". A plugin that can — the shipped
+ * one is `dsh-workspace-guard`, published on the cordis service
+ * `workspaceGuard` — implements this face. A refusal is expressed by throwing:
+ * the launch then fails with the gate's own message, which is built to name the
+ * failing criterion and its holder, rather than a board-invented reason.
+ */
+export interface TaskBoardWorkspaceGate {
+  /**
+   * Judge the workspace this launch is about to use.
+   * @param request - the card, the resolved workspace, and the write-back hook.
+   */
+  prepare(request: TaskBoardWorkspaceGateRequest): Promise<void>
+}
+
+/** Optional workspace guard wired into the runner, with its board-owned writer. */
+export interface TaskBoardWorkspaceGuard {
+  /** The gate to consult before every launch. */
+  readonly gate: TaskBoardWorkspaceGate
+  /**
+   * Persist a gate-chosen workspace onto the card.
+   * @param taskId - the card.
+   * @param workspaceId - the workspace the run must use from now on.
+   */
+  record(taskId: string, workspaceId: string): void
+}
+
 export class HostExecutionRunner {
   /** Newest scanned event sequence per session with no matching execution end. */
   private readonly scanMemos = new Map<string, number>()
@@ -324,6 +378,7 @@ export class HostExecutionRunner {
     private readonly commands?: SessionCommandDispatcher,
     private readonly workspaceRegistry?: TaskBoardWorkspaceRegistry,
     unavailableRetry?: { attempts?: number; backoffMs?: number },
+    private readonly workspaceGuard?: TaskBoardWorkspaceGuard,
   ) {
     this.unavailableAttempts = unavailableRetry?.attempts ?? SERVICE_UNAVAILABLE_ATTEMPTS
     this.unavailableBackoffMs = unavailableRetry?.backoffMs ?? SERVICE_UNAVAILABLE_BACKOFF_MS
@@ -384,9 +439,33 @@ export class HostExecutionRunner {
     // workspace instead of being left to `session.create`, whose own fallback is
     // the Host process working directory (the desktop app's profile directory) —
     // never the project the user was in when the card was written.
-    const workspaceId = task.handover?.workspaceId ?? task.workspaceId ?? this.recentWorkspaceId()
+    let workspaceId = task.handover?.workspaceId ?? task.workspaceId ?? this.recentWorkspaceId()
     const mode = task.handover?.mode ?? task.mode
     const permission = task.handover?.permission ?? task.permission
+
+    // Workspace pre-flight. The board knows which workspace a card names and
+    // nothing about whether that workspace may be used: it has no concept of
+    // occupancy, of uncommitted work, or of another worker already inside. A
+    // plugin that does publishes `workspaceGuard`, and this is the one place a
+    // launch resolves its workspace — so the gate runs here, before the presence
+    // check. Its refusal, which names the failing criterion and its holder, is
+    // then what the caller reads instead of a bare "workspace not found"; and a
+    // card that pinned nothing can be given a workspace and have it recorded.
+    if (this.workspaceGuard !== undefined) {
+      const guard = this.workspaceGuard
+      await guard.gate.prepare({
+        taskId: task.id,
+        title: task.title,
+        prompt: task.prompt,
+        ...(workspaceId === undefined ? {} : { workspaceId }),
+        record: (assigned) => {
+          if (assigned === workspaceId) return
+          workspaceId = assigned
+          // The board owns the ledger, so the gate decides and the board writes.
+          guard.record(task.id, assigned)
+        },
+      })
+    }
 
     if (workspaceId !== undefined && this.workspaceRegistry !== undefined) {
       if (!this.workspaceRegistry.list().some(item => item.id === workspaceId)) {
