@@ -351,16 +351,30 @@ function lookupOf(registry: AgentToolRegistry | undefined): { get: (name: string
  * guard row that mounts after the board is still picked up.
  *
  * @param ctx - the plugin context.
- * @returns the gate, or undefined when no guard plugin is installed.
+ * @returns a stable gate that forwards to the installed guard, or does nothing
+ *   when none is installed.
  */
-export function resolveWorkspaceGate(ctx: Context): TaskBoardWorkspaceGate | undefined {
-  try {
-    const guard = ctx.get('workspaceGuard') as { prepare?: unknown } | undefined
-    return guard !== undefined && typeof guard.prepare === 'function'
-      ? guard as TaskBoardWorkspaceGate
-      : undefined
-  } catch {
-    return undefined
+export function resolveWorkspaceGate(ctx: Context): TaskBoardWorkspaceGate {
+  const lookup = (): TaskBoardWorkspaceGate | undefined => {
+    try {
+      const guard = ctx.get('workspaceGuard') as { prepare?: unknown } | undefined
+      return guard !== undefined && typeof guard.prepare === 'function'
+        ? guard as TaskBoardWorkspaceGate
+        : undefined
+    } catch {
+      return undefined
+    }
+  }
+  // Resolved LAZILY, per launch, behind a stable wrapper. A construction-time
+  // lookup is wrong: the guard's row may mount after this one — in the shipped
+  // profile it is appended last, after the web-all bundle that carries this
+  // board — so a one-shot resolution returns undefined and silently disables the
+  // gate for the entire process lifetime. The wrapper is stable; the gate behind
+  // it is looked up on every launch, so mount order stops mattering.
+  return {
+    async prepare(request) {
+      await lookup()?.prepare(request)
+    },
   }
 }
 
