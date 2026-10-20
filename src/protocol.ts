@@ -120,11 +120,89 @@ export interface TaskBoardVerificationOptions {
   catalog: ModelCatalogView
 }
 
-/** SSE event frame: revision/scheduler/power only, never the task list. */
+/**
+ * SSE event frame: revision/scheduler/power plus the binding prompts, never the
+ * task list.
+ *
+ * `binding` rides this frame because a blocked turn is a live state, not a
+ * ledger revision: the Host holds the turn open and needs the browser to show
+ * the modal NOW, and the frame is the only channel the Host already pushes on.
+ * The SSE route sends the current frame again on connect, so a tab that opens
+ * (or reconnects) while a turn waits still learns about the prompt.
+ */
 export interface TaskBoardEventPayload {
   revision: number
   scheduler: TaskBoardSchedulerSnapshot
   power: TaskBoardPowerSnapshot
+  /**
+   * Turns currently waiting for the user to pick a card — an empty array when
+   * none is. The Host always sends the field, so a client can tell "nothing is
+   * waiting" from a frame produced by a Host that predates binding; optional
+   * because those older frames exist on the wire.
+   */
+  binding?: readonly TaskBoardBindingPrompt[]
+}
+
+/** One card a blocked turn offers the user. */
+export interface TaskBoardBindingCandidate {
+  /** The card id; this is what a choice names. */
+  taskId: string
+  /** Card title, so the modal needs no second fetch to render a row. */
+  title: string
+  /** Column the card sits in now (the modal shows it, the Host re-checks it). */
+  status: TaskStatus
+  /** Association instant, already ordered by the Host. */
+  linkedAt: number
+  /** The card ran in this session. */
+  viaExecution: boolean
+  /** The card was created from this session. */
+  viaCreatedBy: boolean
+}
+
+/**
+ * A turn that is blocked until the user answers, or until its own budget runs
+ * out. `deadlineAt` lets the modal say how long it may still wait; the Host
+ * releases the turn on its own and the client's copy simply disappears with
+ * the next frame.
+ */
+export interface TaskBoardBindingPrompt {
+  /** Session whose turn is waiting; only that session's modal may answer it. */
+  sessionId: string
+  /** When the question was raised (ms epoch). */
+  createdAt: number
+  /** When the Host stops waiting (ms epoch). */
+  deadlineAt: number
+  /** The candidate cards, most recently associated first. */
+  candidates: readonly TaskBoardBindingCandidate[]
+}
+
+/**
+ * Body of `POST {TASK_BOARD_API_PREFIX}/bind`: the user's answer to one prompt.
+ *
+ * `taskId: null` is a deliberate "none of these this turn" — it releases the
+ * turn without binding a card, and it is different from saying nothing (which
+ * leaves the Host waiting until its deadline).
+ */
+export interface TaskBoardBindingChoice {
+  sessionId: string
+  taskId: string | null
+}
+
+/**
+ * Strict parse of a `/bind` body; undefined rejects the request.
+ *
+ * `sessionId` must name a session the Host is actually waiting for, which the
+ * route checks: this parser only guarantees the shape.
+ */
+export function parseBindingChoice(value: unknown): TaskBoardBindingChoice | undefined {
+  const body = record(value)
+  if (body === undefined) return undefined
+  if (!exactKeys(body, ['sessionId', 'taskId'])) return undefined
+  if (typeof body.sessionId !== 'string' || body.sessionId.trim() === '') return undefined
+  if (body.sessionId.length > ASSERTED_SESSION_MAX_LENGTH) return undefined
+  if (body.taskId === null) return { sessionId: body.sessionId.trim(), taskId: null }
+  if (typeof body.taskId !== 'string' || body.taskId.trim() === '') return undefined
+  return { sessionId: body.sessionId.trim(), taskId: body.taskId.trim() }
 }
 
 /**

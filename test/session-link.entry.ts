@@ -2,9 +2,11 @@
  * Real-path checks for the host half of "task <-> session" linking.
  *
  * Everything here drives the actual HostTaskLedger (bundled through esbuild by
- * test/run.mjs), the actual wire gate in protocol.ts, and the real on-disk v6
- * document copied out of ~/.dsh/task-board — no hand-built TaskRecord stands in
- * for a row the Host produced.
+ * test/run.mjs), the actual wire gate in protocol.ts, and a FROZEN v6 document
+ * from `test/fixtures/` — no hand-built TaskRecord stands in for a row the Host
+ * produced, and no assertion is a claim about the user's live board (that is
+ * what used to break this file: its "no row carries createdBySessionId"
+ * premise expired the moment real cards started carrying the field).
  *
  * Usage: node test/run.mjs test/session-link.entry.ts
  */
@@ -17,8 +19,8 @@ import { HostTaskLedger } from '../src/host-ledger.ts'
 import { parseLedger } from '../src/core/store.ts'
 import { createTask } from '../src/core/tasks.ts'
 import { parseActionEnvelope } from '../src/protocol.ts'
+import { FIXTURE_LEDGER_PATH, FIXTURE_LEDGER_SHA256, FIXTURE_TASK_COUNT, readFixtureLedger } from './fixtures/ledger-fixture.ts'
 
-const REAL_LEDGER = process.env.TB_REAL_LEDGER ?? '/Users/lee/.dsh/task-board/ledger-v2.json'
 const NOW = 1_760_000_000_000
 const SESSION = 'session-84a09234-1111-2222-3333-444455556666'
 
@@ -77,24 +79,42 @@ const rowOf = (dir: string, id: string): Record<string, unknown> => {
   second.dispose()
 }
 
-// --- D: the real v6 document still loads, whole, and the original is untouched --
+// --- D: the frozen v6 document still loads, whole, and is never written -------
 {
-  const digestBefore = sha256(REAL_LEDGER)
-  const source = JSON.parse(readFileSync(REAL_LEDGER, 'utf8')) as { schemaVersion: number; tasks: unknown[] }
+  // The fixture is verified (digest + row list) by the reader, so this group
+  // asserts the LOAD contract on input nobody can drift: rows kept in order,
+  // every stored origin session survives verbatim, a row that never had one
+  // stays without it, and an already-settled execution survives the round trip.
+  const { fixture, digest } = readFixtureLedger()
+  assert.equal(digest, FIXTURE_LEDGER_SHA256)
+  assert.equal(fixture.tasks.length, FIXTURE_TASK_COUNT)
+  const digestBefore = sha256(FIXTURE_LEDGER_PATH)
   const dir = tempDir('tb-link-d-')
-  copyFileSync(REAL_LEDGER, join(dir, 'ledger-v2.json'))
+  copyFileSync(FIXTURE_LEDGER_PATH, join(dir, 'ledger-v2.json'))
   const ledger = new HostTaskLedger(dir, () => NOW)
   const state = ledger.state()
-  assert.equal(state.tasks.length, source.tasks.length)
+  assert.equal(state.tasks.length, fixture.tasks.length)
   assert.equal(state.scheduler.error, undefined)
-  for (const task of state.tasks) assert.equal(task.createdBySessionId, undefined)
-  console.log(`D ok  copied ${REAL_LEDGER} -> ${join(dir, 'ledger-v2.json')}`)
-  console.log(`D ok  source schemaVersion=${source.schemaVersion} tasks=${source.tasks.length}; loaded tasks=${state.tasks.length}; scheduler.error=${String(state.scheduler.error)}`)
+  assert.deepEqual(state.tasks.map(task => task.id), fixture.tasks.map(task => task.id))
+  for (const stored of fixture.tasks) {
+    const loaded = state.tasks.find(task => task.id === stored.id)
+    assert.ok(loaded !== undefined, `row ${stored.id} was dropped by the load`)
+    // Absent stays absent (not "" and not null), present is kept byte-identical:
+    // the field is provenance, and a load must never invent or blank one.
+    assert.equal(loaded.createdBySessionId, stored.createdBySessionId, `${stored.id} origin session changed on load`)
+    if (stored.createdBySessionId === undefined) {
+      assert.equal('createdBySessionId' in (rowOf(dir, stored.id)), false, `${stored.id} gained the field on disk`)
+    }
+    assert.equal(loaded.executions.length, stored.executions.length, `${stored.id} execution history changed on load`)
+    assert.equal(loaded.executions[0]?.endedAt, stored.executions[0]?.endedAt, `${stored.id} execution settlement changed on load`)
+  }
+  console.log(`D ok  loaded frozen fixture ${FIXTURE_LEDGER_PATH} (${digest.slice(0, 12)}…) into ${join(dir, 'ledger-v2.json')}`)
+  console.log(`D ok  schemaVersion=${fixture.schemaVersion} rows=${fixture.tasks.length}; loaded=${state.tasks.length}; scheduler.error=${String(state.scheduler.error)}`)
   console.log('D ok  createdBySessionId after load:', state.tasks.map(task => String(task.createdBySessionId)).join(', '))
-  console.log('D ok  ids kept:', state.tasks.map(task => task.id).join(', '))
+  console.log('D ok  executions after load:', state.tasks.map(task => `${task.id}:${task.executions.length}`).join(', '))
   ledger.dispose()
-  assert.equal(sha256(REAL_LEDGER), digestBefore)
-  console.log('D ok  the real ledger was not written:', digestBefore)
+  assert.equal(sha256(FIXTURE_LEDGER_PATH), digestBefore)
+  console.log('D ok  the fixture was not written:', digestBefore)
 }
 
 // --- E: the origin field is write-once -----------------------------------------

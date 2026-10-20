@@ -129,3 +129,134 @@
   border: 1px solid var(--dsw-alias-border-l3);
   border-radius: 5px;
 }
+
+/* The blocking binding modal a turn raises when the session has several cards.
+ *
+ * It is `position: fixed` rather than a portal: the browser half may not
+ * require react-dom (the build pins its external surface to react and
+ * react/jsx-runtime), so the seat renders the overlay in place and lifts it
+ * above the shell with a fixed layer. The header itself is not transformed, so
+ * the fixed containing block is the viewport. */
+.bindBackdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: color-mix(in srgb, var(--dsw-alias-bg-inverse, #000) 32%, transparent);
+}
+
+.bindModal {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(440px, 100%);
+  max-height: min(70vh, 560px);
+  padding: 18px;
+  outline: none;
+  background: var(--dsw-alias-bg-base);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 12px;
+  box-shadow: var(--dsw-shadow-lv3, var(--dsw-shadow-lv2));
+}
+
+.bindTitle {
+  margin: 0;
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 22px;
+}
+
+.bindHint {
+  margin: 0;
+  color: var(--dsw-alias-label-caption);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.bindList {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.bindItem {
+  appearance: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--dsw-alias-border-l3);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.bindItem:hover,
+.bindItem:focus-visible {
+  background: var(--dsw-alias-interactive-bg-hover);
+  border-color: var(--dsw-alias-border-l2);
+}
+
+.bindItem:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary);
+  outline-offset: 1px;
+}
+
+.bindItemTitle {
+  overflow: hidden;
+  font-size: 13px;
+  line-height: 18px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bindMeta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--dsw-alias-label-caption);
+  font-size: 11px;
+  line-height: 15px;
+}
+
+.bindDeadline {
+  margin: 0;
+  color: var(--dsw-alias-label-caption);
+  font-size: 11px;
+  line-height: 15px;
+}
+
+.bindFooter {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.bindSkip {
+  appearance: none;
+  padding: 5px 10px;
+  border: 1px solid var(--dsw-alias-border-l3);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.bindSkip:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}

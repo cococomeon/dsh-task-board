@@ -6,6 +6,7 @@ import {
   isTaskParseDraft,
   TASK_BOARD_API_PREFIX,
   type TaskBoardAction,
+  type TaskBoardBindingChoice,
   type TaskBoardActionEnvelope,
   type TaskBoardEventPayload,
   type TaskBoardParseDraft,
@@ -196,6 +197,11 @@ export interface TaskBoardHostTransport {
   subscribe(listener: (event?: TaskBoardEventPayload) => void): () => void
   /** One-shot model parse of pasted text (issue #1540). */
   parseDraft(request: TaskBoardParseRequest, signal?: AbortSignal): Promise<TaskBoardParseDraft>
+  /**
+   * Answer the card-binding modal of a turn the Host is holding open. Resolves
+   * to false when that turn is no longer waiting (its budget expired first).
+   */
+  bindChoice(choice: TaskBoardBindingChoice): Promise<boolean>
 }
 
 export class HttpTaskBoardHostTransport implements TaskBoardHostTransport {
@@ -303,6 +309,34 @@ export class HttpTaskBoardHostTransport implements TaskBoardHostTransport {
     if (code === 'timeout') throw new HostApiError('timeout', t('new.aiParseTimeout', { seconds: String(TASK_PARSE_TIMEOUT_SECONDS) }), response.status)
     const detail = typeof record?.error === 'string' && record.error !== '' ? record.error : String(response.status)
     throw new HostApiError('rejected', t('new.aiParseFailed', { error: detail }), response.status)
+  }
+
+  /**
+   * Deliver the modal answer to the route that owns the blocked turn.
+   *
+   * The answer does NOT come back as a snapshot: the Host responds with a bare
+   * ok, and the ledger change that follows (the card moving to `running`)
+   * arrives as an ordinary event frame, so the board updates through the one
+   * path every other mutation already uses.
+   */
+  async bindChoice(choice: TaskBoardBindingChoice): Promise<boolean> {
+    const controller = new AbortController()
+    const timeout = globalThis.setTimeout(() => { controller.abort() }, REQUEST_TIMEOUT_MS)
+    try {
+      const response = await fetch(`${CLIENT_API_PREFIX}/bind`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(choice),
+        signal: controller.signal,
+      })
+      // 409 is the Host saying "that turn is no longer waiting" — a late click,
+      // not a failure: the modal is simply gone.
+      if (response.status === 409) return false
+      await readJson<unknown>(response)
+      return true
+    } finally {
+      globalThis.clearTimeout(timeout)
+    }
   }
 
   subscribe(listener: (event?: TaskBoardEventPayload) => void): () => void {

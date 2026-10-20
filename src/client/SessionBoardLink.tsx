@@ -23,6 +23,7 @@ import type { TaskRecord } from '../core/tasks.ts'
 import { STATUS_KEY } from './board/status-key.ts'
 import { t } from './locales.ts'
 import { resolveSessionLink, type SessionLinkState } from './session-cards.ts'
+import { SessionBindModal } from './SessionBindModal.tsx'
 import css from './session-link.module.css'
 
 /** The conversation header's actions seat (declared by dsh-client-ui-conversation). */
@@ -107,6 +108,11 @@ export function SessionBoardLink({ controller, sessions, sessionId }: SessionBoa
   const activeId = sessionId ?? tracked
   const link = useMemo(() => resolveSessionLink(snapshot.tasks, activeId), [snapshot.tasks, activeId])
 
+  // A turn of THIS session may be blocked on the binding modal. The prompt is
+  // published for every session, and only the one it names may answer it — the
+  // header is the one surface that knows which session it is rendering for.
+  const binding = (snapshot.binding ?? []).find(prompt => prompt.sessionId === activeId)
+
   const [open, setOpen] = useState(false)
   const rootRef = useRef<HTMLSpanElement>(null)
   const buttonRef = useRef<HTMLButtonElement>(null)
@@ -179,43 +185,54 @@ export function SessionBoardLink({ controller, sessions, sessionId }: SessionBoa
     : link.mode === 'jump' ? t('sessionLink.open') : t('sessionLink.choose')
 
   return (
-    <span className={css.root} ref={rootRef}>
-      <button
-        type="button"
-        ref={buttonRef}
-        className={disabled ? `${css.button} ${css.buttonDisabled}` : css.button}
-        onClick={onClick}
-        title={label}
-        aria-label={label}
-        aria-disabled={disabled || undefined}
-        aria-haspopup={link.mode === 'choose' ? 'menu' : undefined}
-        aria-expanded={link.mode === 'choose' ? open : undefined}
-      >
-        <IconBoardLink />
-      </button>
-      {open && (
-        <ul className={css.panel} role="menu" aria-label={t('sessionLink.menu')} ref={panelRef}>
-          {link.cards.map(card => (
-            <li key={card.task.id} role="none">
-              <button
-                type="button"
-                role="menuitem"
-                className={css.item}
-                onClick={() => { jumpTo(card.task) }}
-              >
-                <span className={css.itemTitle}>{card.task.title}</span>
-                <span className={css.meta}>
-                  <span>{t(STATUS_KEY[card.task.status])}</span>
-                  {reasonsOf(card).map(reason => (
-                    <span className={css.reason} key={reason}>{reason}</span>
-                  ))}
-                </span>
-              </button>
-            </li>
-          ))}
-        </ul>
+    <>
+      <span className={css.root} ref={rootRef}>
+        <button
+          type="button"
+          ref={buttonRef}
+          className={disabled ? `${css.button} ${css.buttonDisabled}` : css.button}
+          onClick={onClick}
+          title={label}
+          aria-label={label}
+          aria-disabled={disabled || undefined}
+          aria-haspopup={link.mode === 'choose' ? 'menu' : undefined}
+          aria-expanded={link.mode === 'choose' ? open : undefined}
+        >
+          <IconBoardLink />
+        </button>
+        {open && (
+          <ul className={css.panel} role="menu" aria-label={t('sessionLink.menu')} ref={panelRef}>
+            {link.cards.map(card => (
+              <li key={card.task.id} role="none">
+                <button
+                  type="button"
+                  role="menuitem"
+                  className={css.item}
+                  onClick={() => { jumpTo(card.task) }}
+                >
+                  <span className={css.itemTitle}>{card.task.title}</span>
+                  <span className={css.meta}>
+                    <span>{t(STATUS_KEY[card.task.status])}</span>
+                    {reasonsOf(card).map(reason => (
+                      <span className={css.reason} key={reason}>{reason}</span>
+                    ))}
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </span>
+      {/* The modal lives OUTSIDE the header's inline wrapper: it is a
+        * fixed-position layer, and the span is only the button's box. It also
+        * must not sit inside a span (invalid nesting). */}
+      {binding !== undefined && (
+        <SessionBindModal
+          prompt={binding}
+          onChoose={taskId => { controller.chooseBinding(binding.sessionId, taskId) }}
+        />
       )}
-    </span>
+    </>
   )
 }
 

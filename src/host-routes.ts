@@ -7,8 +7,10 @@ import { isLoopbackAddress, isLoopbackRequest } from './loopback.ts'
 import { TaskParseError, TASK_PARSE_MAX_INPUT } from './host-ai.ts'
 import {
   parseActionEnvelope,
+  parseBindingChoice,
   parseTaskParseRequest,
   TASK_BOARD_API_PREFIX,
+  type TaskBoardBindingChoice,
   type TaskBoardParseDraft,
   type TaskBoardParseRequest,
 } from './protocol.ts'
@@ -34,6 +36,12 @@ export interface TaskBoardRouteAccess {
  */
 export interface TaskBoardRouteOptions {
   parseTask?: (request: TaskBoardParseRequest, signal: AbortSignal) => Promise<TaskBoardParseDraft>
+  /**
+   * Answer a turn that is blocked on the card-binding modal. Returns false when
+   * no turn of that session is waiting — the browser then just drops its copy
+   * of the prompt instead of believing it bound something.
+   */
+  bindChoice?: (choice: TaskBoardBindingChoice) => boolean
 }
 
 interface ResolvedRouteAccess {
@@ -215,6 +223,34 @@ export function makeTaskBoardRoutes(
       }
     },
   }
+  const bind: WebRoute = {
+    kind: 'exact',
+    path: `${TASK_BOARD_API_PREFIX}/bind`,
+    handler: async (req, res): Promise<void> => {
+      if (req.method !== 'POST') return writeJson(res, 405, { ok: false, error: 'method-not-allowed' }, { 'cache-control': 'no-store' })
+      if (!guard(req, res)) return
+      if (!(req.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')) {
+        return writeJson(res, 415, { ok: false, error: 'json-required' }, { 'cache-control': 'no-store' })
+      }
+      let body: { raw: string; value: unknown }
+      try {
+        body = await readBody(req)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return writeJson(res, message === 'body-too-large' ? 413 : 400, { ok: false, error: message }, { 'cache-control': 'no-store' })
+      }
+      if (Buffer.byteLength(body.raw) > ACTION_LIMIT) {
+        return writeJson(res, 413, { ok: false, error: 'body-too-large' }, { 'cache-control': 'no-store' })
+      }
+      const choice = parseBindingChoice(body.value)
+      if (choice === undefined) return writeJson(res, 400, { ok: false, error: 'invalid-binding-choice' }, { 'cache-control': 'no-store' })
+      // A late answer is not an error the user caused: the turn's budget may
+      // have expired while the tab was still showing the modal, so the browser
+      // is told the prompt is gone (409) instead of being told it failed.
+      const accepted = options.bindChoice?.(choice) === true
+      writeJson(res, accepted ? 200 : 409, accepted ? { ok: true } : { ok: false, error: 'no-pending-binding' }, { 'cache-control': 'no-store' })
+    },
+  }
   const events: WebRoute = {
     kind: 'exact',
     path: `${TASK_BOARD_API_PREFIX}/events`,
@@ -302,5 +338,5 @@ export function makeTaskBoardRoutes(
       }
     },
   }
-  return [state, action, events, parse, verification]
+  return [state, action, bind, events, parse, verification]
 }

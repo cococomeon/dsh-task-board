@@ -25,6 +25,8 @@ import { sameSessionRuntimeStates, type SessionRuntimeState } from './session-st
 import { DEFAULT_SUBTASK_DEPTH } from './subtask.ts'
 import type {
   TaskBoardAction,
+  TaskBoardBindingChoice,
+  TaskBoardBindingPrompt,
   TaskBoardEventPayload,
   TaskBoardParseDraft,
   TaskBoardParseRequest,
@@ -49,6 +51,12 @@ export interface TaskBoardTransport {
    * that cannot parse simply omits it, and the form hides the section.
    */
   parseDraft?(request: TaskBoardParseRequest, signal?: AbortSignal): Promise<TaskBoardParseDraft>
+  /**
+   * Answer the turn-binding prompt of a session. Optional: a transport that
+   * serves no such route leaves the modal without a way to answer, so the Host
+   * resolves the prompt on its own deadline.
+   */
+  bindChoice?(choice: TaskBoardBindingChoice): Promise<boolean>
 }
 
 /**
@@ -176,6 +184,12 @@ export interface ControllerSnapshot {
   visibility?: readonly TaskBoardVisibilityPredicate[]
   /** Read-only summaries published by running extensions, keyed by extension id. */
   extensions?: Readonly<Record<string, unknown>>
+  /**
+   * Turns the Host is holding open until this browser answers which card they
+   * bind. Absent (or empty) when no turn is blocked; the modal is the only
+   * surface that reads it, and only for the session it names.
+   */
+  binding?: readonly TaskBoardBindingPrompt[]
 }
 
 /** The selected task (resolved from the ledger), or undefined. */
@@ -232,6 +246,12 @@ export class BoardController {
   private visibility: readonly TaskBoardVisibilityPredicate[] = []
   private remoteSubscribed = false
   private remoteInitialization: Promise<boolean> | undefined
+  /**
+   * Turns the Host is holding open for an answer, as last published. Kept apart
+   * from `hostState` because it is not part of a /state snapshot: it only ever
+   * arrives on an event frame, and it must survive a full state refetch.
+   */
+  private binding: readonly TaskBoardBindingPrompt[] = []
 
   /** @param deps - store and the sessions navigation face. */
   constructor(private readonly deps: ControllerDeps) {
@@ -283,6 +303,7 @@ export class BoardController {
       ...(this.hostState === undefined ? {} : { host: this.hostState }),
       visibility: this.visibility,
       ...(this.hostState?.extensions === undefined ? {} : { extensions: this.hostState.extensions }),
+      ...(this.binding.length === 0 ? {} : { binding: this.binding }),
     }
   }
 
@@ -526,6 +547,29 @@ export class BoardController {
     }
     this.tasks = this.tasks.map(task => task.id === id ? withStatus(task, status, this.now()) : task)
     this.persistAndNotify()
+  }
+
+  /**
+   * Answer the card-binding modal of one turn.
+   *
+   * The local copy of the prompt is dropped optimistically: the modal is a
+   * blocking question for the TURN, not for the board, so leaving it painted
+   * while the POST travels would let the user answer twice. The Host's own
+   * frame puts the truth back if the answer was refused.
+   * @param sessionId - the session whose turn is waiting.
+   * @param taskId - the chosen card, or null for "none of these this turn".
+   */
+  chooseBinding(sessionId: string, taskId: string | null): void {
+    const bind = this.deps.transport?.bindChoice
+    const transport = this.deps.transport
+    this.binding = this.binding.filter(prompt => prompt.sessionId !== sessionId)
+    this.notify()
+    if (transport === undefined || bind === undefined) return
+    void bind.call(transport, { sessionId, taskId }).catch((error: unknown) => {
+      // A refused answer (the turn's budget expired first) is not a board
+      // error: the prompt is already gone from the next frame.
+      console.warn('[dsh-task-board] binding answer was not accepted', messageOf(error))
+    })
   }
 
   /**
@@ -838,6 +882,11 @@ export class BoardController {
    * re-serialize the whole ledger per tab even while nothing changes.
    */
   private onRemoteEvent(event: TaskBoardEventPayload | undefined): void {
+    // The binding prompts ride the frame rather than the snapshot: the Host
+    // raises one while a turn waits and drops it when the turn moves on, with
+    // no ledger revision in between. Taking it before the revision check is
+    // what makes the modal appear during the fast path below.
+    if (event !== undefined && event.binding !== undefined) this.binding = event.binding
     if (event !== undefined && this.hostState !== undefined && event.revision === this.hostState.revision
       && typeof event.scheduler === 'object' && event.scheduler !== null
       && typeof event.power === 'object' && event.power !== null) {

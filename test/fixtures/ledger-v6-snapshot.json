@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 6,
+  "revision": 7,
+  "tasks": [
+    {
+      "id": "fixture-alpha",
+      "title": "fixture alpha",
+      "description": "frozen row",
+      "prompt": "p",
+      "status": "todo",
+      "createdAt": 1760000000000,
+      "updatedAt": 1760000000000,
+      "executions": [],
+      "createdBySessionId": "session-fixture-alpha-0001"
+    },
+    {
+      "id": "fixture-beta",
+      "title": "fixture beta",
+      "description": "frozen row",
+      "prompt": "p",
+      "status": "todo",
+      "createdAt": 1760000000000,
+      "updatedAt": 1760000000000,
+      "executions": []
+    },
+    {
+      "id": "fixture-gamma",
+      "title": "fixture gamma",
+      "description": "frozen row",
+      "prompt": "p",
+      "status": "done",
+      "createdAt": 1760000000000,
+      "updatedAt": 1760000000000,
+      "executions": [
+        {
+          "id": "exec-fixture-01",
+          "startedAt": 1760000000000,
+          "endedAt": 1760000000000,
+          "result": "succeeded",
+          "runGroupId": "group-fixture-01",
+          "ownResult": "succeeded"
+        }
+      ],
+      "createdBySessionId": "session-fixture-gamma-0001"
+    }
+  ],
+  "scheduler": {
+    "timeZone": "Asia/Shanghai",
+    "ledgerId": "fixture-ledger-0001"
+  },
+  "recentRequests": [
+    {
+      "requestId": "fixture-1",
+      "fingerprint": "654bd6a44700418538bd19b4cd71730c31391bc5867bf988edadaf268fd2ffe8"
+    },
+    {
+      "requestId": "fixture-2",
+      "fingerprint": "9a3b4b8db0e00d0549725b1629aa577d864c6e084277a38e41ddd58e2fca9bcc"
+    },
+    {
+      "requestId": "fixture-3",
+      "fingerprint": "49073aaed4fec3aa96b60d64643572b263d93ede92b84cd410f59b9ddea80119"
+    },
+    {
+      "requestId": "fixture-4",
+      "fingerprint": "4aa657f594ebed7416c5a48535767beff6f807285b3006ede73af40e05aeea25"
+    },
+    {
+      "requestId": "fixture-5",
+      "fingerprint": "94a6be89d49f9d45f9d125f07117275b38c24e948b27d6cd880f75b5352f0eed"
+    },
+    {
+      "requestId": "fixture-6",
+      "fingerprint": "0e34b714ce4e5aa2f823a8ca9f29b7a1c9340c1301c758177384124c9566ed83"
+    }
+  ]
+}
