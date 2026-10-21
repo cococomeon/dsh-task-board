@@ -1393,6 +1393,28 @@ export class HostTaskLedger {
         if (this.settleCascade(task.id, groupId, now)) changed = true
       }
     }
+    // A card still sitting in the running column whose executions are ALL closed
+    // has missed its settle — a process that died between closing the execution
+    // and moving the column leaves exactly this. No group scan can reach it,
+    // because a group is only collected from executions that are still open, so
+    // without this pass the card stays "running" forever while reporting a
+    // finished verdict: the board refuses to move it (an open execution is what
+    // the manual-move lock tests, and this card has none) and no automatic fold
+    // ever looks at it again.
+    for (const task of this.document.tasks) {
+      if (task.status !== 'running' || hasOpenExecution(task)) continue
+      const latest = task.executions[task.executions.length - 1]
+      const result = latest?.result
+      if (result === undefined) continue
+      // A parent is still owed its children's verdicts: if any member of its run
+      // group is open, the fold above will close it once they land.
+      if (latest.runGroupId !== undefined
+        && pendingCascadeChildren(this.document.tasks, task.id, latest.runGroupId).length > 0) continue
+      const status = settledStatus(task, result)
+      if (status === task.status) continue
+      this.document.tasks = this.document.tasks.map(item => item.id === task.id ? withStatus(item, status, now) : item)
+      changed = true
+    }
     if (changed && persist) this.commit()
     return changed
   }
