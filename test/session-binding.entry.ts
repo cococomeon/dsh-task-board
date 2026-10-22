@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { HostTaskLedger } from '../src/host-ledger.ts'
 import { SessionChoiceStore } from '../src/host/session-choice.ts'
-import { SessionBinder } from '../src/host/session-binder.ts'
+import { lastTurnEndOf, readTurnEnd, SessionBinder } from '../src/host/session-binder.ts'
 import { bindingCandidates, settleStatusOf } from '../src/core/session-binding.ts'
 import { createTask, type ExecutionRecord, type TaskRecord } from '../src/core/tasks.ts'
 
@@ -40,6 +40,10 @@ function card(
     archived?: boolean
     openExecution?: boolean
     at?: number
+    /** Overrides the row's `updatedAt` (ordering against `endedAt` is a fixture). */
+    updatedAt?: number
+    /** Overrides the execution's `endedAt` (default: `at + 10`). */
+    endedAt?: number
   } = {},
 ): TaskRecord {
   const at = options.at ?? NOW
@@ -55,12 +59,13 @@ function card(
       id: `exec-${id}`,
       sessionId: options.sessionId,
       startedAt: at,
-      endedAt: options.openExecution === true ? undefined : at + 10,
+      endedAt: options.openExecution === true ? undefined : (options.endedAt ?? at + 10),
       result: options.openExecution === true ? undefined : 'succeeded',
       error: undefined,
     }
   const task: TaskRecord = {
     ...base,
+    updatedAt: options.updatedAt ?? base.updatedAt,
     status: options.status ?? 'todo',
     executions: execution === undefined ? [] : [execution],
     ...(options.archived === true ? { archivedAt: at + 20 } : {}),
@@ -117,7 +122,7 @@ const statusOf = (ledger: HostTaskLedger, id: string): string => {
 
 const noSignal = new AbortController()
 
-// --- A: candidate filtering (archived / verified / open execution) ------------
+// --- A: candidate filtering (archived / open execution; verified is bindable) --
 {
   const { ledger } = binderOver()
   card(ledger, 'live', { sessionId: SESSION })
@@ -126,8 +131,8 @@ const noSignal = new AbortController()
   card(ledger, 'openrun', { sessionId: SESSION, status: 'running', openExecution: true })
   card(ledger, 'foreign', { sessionId: OTHER_SESSION })
   const ids = bindingCandidates(ledger.allTasks(), SESSION).map(entry => entry.task.id)
-  assert.deepEqual(ids, ['live'])
-  line('only the bindable card survives (archived/verified/open-execution excluded)', ids)
+  assert.deepEqual(ids, ['live', 'verified'])
+  line('archived and open-execution cards are excluded; a verified card is bindable', ids)
 }
 
 // --- B: zero candidates is a no-op ------------------------------------------
@@ -408,6 +413,153 @@ const noSignal = new AbortController()
   await afterRun
   assert.equal(statusOf(ledger, 'old-a'), 'running')
   line('after the run ends the session binds normally again')
+}
+
+// --- O: the turn/end payload is WRAPPED under `data` (regression) ------------
+{
+  // The runtime builds every published event as { type, seq, time, data }, so
+  // the payload of append('turn/end', { turn, reason }) lands under `data`.
+  // Reading turn/reason off the event itself yielded undefined, which made the
+  // settle key `${sessionId}#undefined`; it never matched the recorded turn and
+  // every bound card stayed in `running` forever.
+  const wrapped = { type: 'turn/end', seq: 9, time: 1_700_000_000_000, data: { turn: 4, reason: { kind: 'completed' } } }
+  assert.deepEqual(readTurnEnd(wrapped), { turn: 4, reason: { kind: 'completed' } })
+  assert.deepEqual(readTurnEnd({ type: 'turn/end', data: { turn: 4 } }), { turn: 4, reason: undefined })
+  // A payload sitting ON the event is not what the runtime publishes.
+  assert.equal(readTurnEnd({ type: 'turn/end', turn: 4, reason: { kind: 'completed' } } as never), undefined)
+  assert.equal(readTurnEnd({ type: 'turn/start', data: { turn: 4 } }), undefined)
+  assert.equal(readTurnEnd({ type: 'turn/end', data: { reason: { kind: 'completed' } } }), undefined)
+  assert.equal(readTurnEnd(undefined), undefined)
+  line('turn/end decode reads the wrapped payload only', readTurnEnd(wrapped))
+}
+
+// --- P: a decoded turn/end actually settles the card the turn moved ---------
+{
+  const { ledger, binder } = binderOver()
+  card(ledger, 'bound', { sessionId: SESSION })
+  await binder.beforeTurn(SESSION, 7, 1, noSignal.signal)
+  assert.equal(statusOf(ledger, 'bound'), 'running')
+
+  const end = readTurnEnd({ type: 'turn/end', seq: 3, time: 1, data: { turn: 7, reason: { kind: 'completed' } } })
+  assert.ok(end !== undefined, 'the wrapped turn/end must decode')
+  if (end !== undefined) binder.afterTurn(SESSION, end.turn, end.reason)
+  assert.equal(statusOf(ledger, 'bound'), 'done')
+  line('decode + afterTurn settles the bound card (no more stuck running)', statusOf(ledger, 'bound'))
+}
+
+// --- P2: a failing turn settles as failed ----------------------------------
+{
+  // Its own ledger: a second card in the first block would make the next turn a
+  // two-candidate turn, which is a different (already covered) path.
+  const { ledger, binder } = binderOver()
+  card(ledger, 'bound-2', { sessionId: SESSION })
+  await binder.beforeTurn(SESSION, 8, 1, noSignal.signal)
+  assert.equal(statusOf(ledger, 'bound-2'), 'running')
+  const failedEnd = readTurnEnd({ type: 'turn/end', data: { turn: 8, reason: { kind: 'error' } } })
+  if (failedEnd !== undefined) binder.afterTurn(SESSION, failedEnd.turn, failedEnd.reason)
+  assert.equal(statusOf(ledger, 'bound-2'), 'failed')
+  line('an error turn settles as failed', statusOf(ledger, 'bound-2'))
+}
+
+// --- O: the recovery pass must not undo a card the binding just moved --------
+// `finalizeReadyRuns` (the poll tick, and the fold inside import/settle) closes
+// a card that sits in `running` with every execution closed: that shape is how
+// a crash between "close the execution" and "move the column" looks. It is ALSO
+// the shape a card takes when it is moved into `running` after its last run
+// closed — which is exactly what the session binding does (it changes the
+// column only, never opens an execution). Without an ordering guard the
+// recovery pass folds the binding straight back, in the same tick.
+{
+  // A movable clock: the whole question is the order of `updatedAt` and
+  // `endedAt`, and a frozen clock cannot express it.
+  let clock = NOW
+  const dir = tempDir('tb-bind-o-')
+  const ledger = new HostTaskLedger(dir, () => clock)
+  const choices = new SessionChoiceStore(tempDir('tb-choice-o-'), () => clock)
+  const binder = new SessionBinder({
+    ledger,
+    choices,
+    hasSubscribers: () => false,
+    publish: () => {},
+    now: () => clock,
+    waitMs: 5_000,
+  })
+
+  // (a) done + one settled execution (updatedAt === endedAt), then the binding
+  //     moves it a second later -> the recovery pass must leave it in running.
+  card(ledger, 'o-bound', { sessionId: SESSION, status: 'done', at: NOW, endedAt: NOW, updatedAt: NOW })
+  clock = NOW + 1_000
+  await binder.beforeTurn(SESSION, 1, 1, noSignal.signal)
+  assert.equal(statusOf(ledger, 'o-bound'), 'running', 'the binding did not move the card')
+  const afterMove = ledger.getTask('o-bound')!
+  assert.ok(afterMove.updatedAt > (afterMove.executions[0].endedAt ?? 0), 'the move did not stamp a later updatedAt')
+  clock = NOW + 2_000
+  assert.equal(ledger.finalizeReadyRuns(), false, 'the recovery pass folded a card that was moved after its execution closed')
+  assert.equal(statusOf(ledger, 'o-bound'), 'running')
+  // The OTHER entry point folds too: an import action runs `finalizeReadyRuns`
+  // inside its own commit, so a card the binding moved must survive that as
+  // well as the poll tick.
+  ledger.applyRequest('o-import-1', {
+    kind: 'import',
+    sourceId: 'o-import-source',
+    tasks: [createTask({ title: 'imported while bound', description: '', prompt: 'p' }, NOW, 'o-imported')],
+  })
+  assert.equal(statusOf(ledger, 'o-bound'), 'running')
+  assert.equal(statusOf(ledger, 'o-imported'), 'todo')
+  line('B2 nail: done -> bound to running survives the recovery pass', `${afterMove.updatedAt} > ${String(afterMove.executions[0].endedAt)}`)
+
+  // (b) crash residue: running + closed execution + updatedAt === endedAt
+  //     -> still folds (the recovery this pass exists for is untouched).
+  card(ledger, 'o-crash', { sessionId: SESSION, status: 'running', at: NOW, endedAt: NOW, updatedAt: NOW })
+  assert.equal(ledger.finalizeReadyRuns(), true, 'a genuine crash residue was not repaired')
+  assert.equal(statusOf(ledger, 'o-crash'), 'done')
+  line('crash residue (updatedAt === endedAt) still folds to done')
+
+  // (c) a human drag into running after the run closed -> not folded either.
+  card(ledger, 'o-dragged', { sessionId: SESSION, status: 'done', at: NOW, endedAt: NOW, updatedAt: NOW })
+  clock = NOW + 3_000
+  ledger.applyRequest('o-drag-1', { kind: 'move', taskId: 'o-dragged', status: 'running' })
+  clock = NOW + 4_000
+  assert.equal(ledger.finalizeReadyRuns(), false, 'the recovery pass reverted a manual drag')
+  assert.equal(statusOf(ledger, 'o-dragged'), 'running')
+  line('manual drag into running is no longer bounced back')
+
+  // (d) the turn still settles its own card: the wrapper the loop publishes is
+  //     read through readTurnEnd, and the card that stayed running closes.
+  const end = readTurnEnd({ type: 'turn/end', seq: 7, time: clock, data: { turn: 1, reason: { kind: 'completed' } } })
+  assert.ok(end !== undefined, 'the wrapped turn/end did not decode')
+  // Negative: the payload lives under `data`, so an event carrying turn/reason
+  // on the outside must NOT decode (that mismatch is what left cards running).
+  assert.equal(readTurnEnd({ type: 'turn/end', seq: 7, time: clock, data: {} }), undefined)
+  clock = NOW + 5_000
+  binder.afterTurn(SESSION, end.turn, end.reason)
+  assert.equal(statusOf(ledger, 'o-bound'), 'done')
+  line('turn/end -> afterTurn -> done, on the card the binding moved')
+  assert.equal(statusOf(ledger, 'o-dragged'), 'running', 'another card was settled by this turn')
+  ledger.dispose()
+}
+
+// --- Q: the idle fallback reads the newest turn/end from the log itself ------
+{
+  // This is the settle trigger that does not depend on event DELIVERY: when the
+  // `turn/end` event never reaches the listener, the agent going idle still
+  // knows its own log.
+  const log = [
+    { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
+    { type: 'turn/end', seq: 2, time: 2, data: { turn: 1, reason: { kind: 'completed' } } },
+    { type: 'assistant/message', seq: 3, time: 3, data: {} },
+    { type: 'turn/end', seq: 4, time: 4, data: { turn: 2, reason: { kind: 'error' } } },
+  ]
+  assert.deepEqual(lastTurnEndOf({ log }), { turn: 2, reason: { kind: 'error' } })
+  assert.equal(lastTurnEndOf({ log: [] }), undefined)
+  assert.equal(lastTurnEndOf(undefined), undefined)
+  assert.equal(lastTurnEndOf({ log: [{ type: 'turn/start', data: { turn: 9 } }] }), undefined)
+  // An undecodable entry is skipped instead of stopping the backwards scan.
+  assert.deepEqual(
+    lastTurnEndOf({ log: [...log, { type: 'turn/end', data: { reason: { kind: 'aborted' } } }] }),
+    { turn: 2, reason: { kind: 'error' } },
+  )
+  line('idle fallback reads the newest turn/end from the log', lastTurnEndOf({ log }))
 }
 
 process.stdout.write('\nsession-binding: all checks passed\n')

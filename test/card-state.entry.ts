@@ -108,6 +108,14 @@ const print = (label: string, value: unknown): void => {
   assert.equal(cardRuntimeState(owned, undefined, false), undefined)
   assert.equal(cardRuntimeState(task({ executions: [{ ...open, sessionId: undefined }] }), live, false), undefined)
   print('C4 no runtime face / no session', cardRuntimeState(owned, undefined, false))
+
+  // A conversation turn binds a card into `running` WITHOUT creating an
+  // execution. That card must still report its session's live state, because
+  // that badge is how "进行中 / 待回答" becomes visible while the user is
+  // talking to it; an execution-only gate left it blank.
+  const bound = task({ status: 'running', createdBySessionId: RUNNING_SESSION })
+  assert.equal(cardRuntimeState(bound, live, false), 'running')
+  print('C5 bound card without an execution reports its creating session', cardRuntimeState(bound, live, false))
 }
 
 // --- D: the controller carries the map and ignores an equal push ------------

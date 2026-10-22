@@ -220,11 +220,18 @@ export const RUNTIME_HINT_KEY: Record<SessionRuntimeState, TaskBoardKey> = {
 /**
  * The live session state a card reports, or undefined when the card has none.
  *
- * Only a card the runner currently owns is eligible: a settled card shares
- * nothing with its session's present (the same session can be reused for a
- * later run), so a stale "running" there would be a lie. Within that gate the
- * linked session's own status decides — including the case the ledger cannot
- * express, a run blocked on a human.
+ * A card is eligible while it claims to be under way — the `running` column —
+ * or while the runner still owns an open execution for it. The second clause is
+ * how a Host run qualifies, and the first is how a conversation turn qualifies:
+ * binding a card back into `running` creates no execution, so an
+ * execution-only gate would leave exactly the cards that are being worked on
+ * right now without their live "running / waiting for you" badge.
+ *
+ * A settled card stays ineligible on purpose: it shares nothing with its
+ * session's present (the same session can be reused for a later run), so a
+ * stale "running" there would be a lie. Within the gate the linked session's
+ * own status decides — including the case the ledger cannot express, a run
+ * blocked on a human.
  * @param task - the task record.
  * @param states - live session state by session id; absent when the runtime
  * exposes none (a shell-less host, or a browser half that never subscribed).
@@ -235,7 +242,8 @@ export function cardRuntimeState(
   states: ReadonlyMap<string, SessionRuntimeState> | undefined,
   archived: boolean,
 ): SessionRuntimeState | undefined {
-  if (archived || states === undefined || !hasOpenExecution(task)) return undefined
+  if (archived || states === undefined) return undefined
+  if (task.status !== 'running' && !hasOpenExecution(task)) return undefined
   const sessionId = cardSessionId(task)
   return sessionId === undefined ? undefined : states.get(sessionId)
 }

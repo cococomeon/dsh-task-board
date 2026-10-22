@@ -15,9 +15,13 @@
  *   renders;
  * - archived cards are out (they are not on the board).
  *
- * Binding narrows that list further: a card the board already treats as
- * settled work (`verified`) or as owned by the runner (an open execution) is
- * never dragged back to `running` by a conversation turn.
+ * Binding narrows that list further: a card the runner owns (an open
+ * execution) is never dragged back to `running` by a conversation turn.
+ *
+ * A human-verified card is deliberately NOT excluded: continuing the
+ * conversation means the work is not settled after all, and the turn's own
+ * ending moves the card on from `running`, so the `verified` seal is released
+ * by the same gesture that reopens the work.
  *
  * @module @linxin666/dsh-client-ui-task-board/core/session-binding
  */
@@ -111,18 +115,22 @@ export function sessionLinkedCards(
 }
 
 /**
- * Whether a turn may bind this card: it is on the board, not human-verified,
- * and the runner does not own it.
+ * Whether a turn may bind this card: it is on the board and the runner does not
+ * own it.
  *
  * `hasOpenExecution` is the load-bearing clause. A card with an open execution
  * belongs to the runner, which settles it from the execution's own outcome;
  * a turn that moved it would be writing a second verdict over the same work.
+ *
+ * A `verified` card is bindable on purpose: continuing the conversation in its
+ * session means the work is not actually settled, and the turn's ending moves
+ * the card on from `running`, so the verification seal is released by the same
+ * gesture that reopens the work.
  * @param task - the card to judge.
  * @returns true when a conversation turn may take the card into `running`.
  */
 export function canBindTask(task: TaskRecord): boolean {
   if (task.archivedAt !== undefined) return false
-  if (task.status === 'verified') return false
   return !hasOpenExecution(task)
 }
 

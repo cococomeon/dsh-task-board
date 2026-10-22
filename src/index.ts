@@ -35,7 +35,7 @@ import {
 } from './core/verification-budget.ts'
 import { DEFAULT_SESSION_PERMISSION } from './core/handover.ts'
 import { buildTaskBoardTools, callingSessionId, TASK_BOARD_TOOL_NAMES } from './host/agent-tools.ts'
-import { SessionBinder } from './host/session-binder.ts'
+import { lastTurnEndOf, readTurnEnd, SessionBinder, type TurnEndLike } from './host/session-binder.ts'
 import { SessionChoiceStore } from './host/session-choice.ts'
 import { PLUGIN_TOOL_SECTION_ORDERS, visibleToolText } from './tool-surface.ts'
 import { makeTaskBoardRoutes } from './host-routes.ts'
@@ -766,24 +766,52 @@ function applyImpl(ctx: Context, config?: Config): void {
         const handle = offPreStep as { dispose(): void }
         disposers.push(() => { handle.dispose() })
       }
-      // `turn/end` is not itself a lifecycle hook — it is a session log event,
-      // and every log append is published here. It is not interceptable, and the
-      // settlement does not need to be: the turn is already over.
+      // The turn's ending is observed through TWO independent signals, because
+      // one of them may never arrive: the log event `turn/end`, and the agent's
+      // own `idle` transition (where the session log is read directly for the
+      // newest `turn/end`). Whichever arrives first settles; the second finds no
+      // outstanding claim and does nothing.
+      const settleFrom = (
+        sessionId: string,
+        end: { turn: number; reason: TurnEndLike | undefined } | undefined,
+      ): void => {
+        if (end === undefined) return
+        binder.afterTurn(sessionId, end.turn, end.reason)
+      }
+      const disposeOn = (handle: unknown): void => {
+        if (typeof handle === 'function') disposers.push(handle as () => void)
+        else if (typeof (handle as { dispose?: unknown } | undefined)?.dispose === 'function') {
+          const owned = handle as { dispose(): void }
+          disposers.push(() => { owned.dispose() })
+        }
+      }
       const offTurnEnd = ctx.on('session/event', (session, event) => {
-        if (event?.type !== 'turn/end') return
+        if ((event as { type?: unknown } | undefined)?.type !== 'turn/end') return
         try {
           const sessionId = callingSessionId({ agent: { session } })
           if (sessionId === undefined) return
-          binder.afterTurn(sessionId, event.turn, event.reason)
+          // The log entry WRAPS the payload: `append(type, data)` publishes
+          // `{ type, seq, time, data }`, so the turn number and the reason live
+          // under `data`. Reading them off the event itself yields undefined,
+          // which silently never matches the turn the binder recorded.
+          settleFrom(sessionId, readTurnEnd(event as { type?: unknown; data?: { turn?: unknown } } | undefined))
         } catch (error) {
           warn(ctx, 'task-board: session binding could not settle the turn', error)
         }
       })
-      if (typeof offTurnEnd === 'function') disposers.push(offTurnEnd)
-      else if (typeof (offTurnEnd as { dispose?: unknown } | undefined)?.dispose === 'function') {
-        const handle = offTurnEnd as { dispose(): void }
-        disposers.push(() => { handle.dispose() })
-      }
+      disposeOn(offTurnEnd)
+      const offIdle = ctx.on('agent/status', (payload: { agent?: unknown; status?: unknown }) => {
+        if (payload?.status !== 'idle') return
+        try {
+          const agent = payload.agent as { session?: { log?: unknown } } | undefined
+          const sessionId = callingSessionId({ agent })
+          if (sessionId === undefined) return
+          settleFrom(sessionId, lastTurnEndOf(agent?.session))
+        } catch (error) {
+          warn(ctx, 'task-board: session binding could not settle on idle', error)
+        }
+      })
+      disposeOn(offIdle)
       const routes = makeTaskBoardRoutes(host, resolveProxyAccess(config), {
         parseTask: async (request, signal) => {
           const llm = resolveLlmRuntime(ctx)

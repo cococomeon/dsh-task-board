@@ -113,6 +113,48 @@ export interface TurnEndLike {
   kind: string
 }
 
+/**
+ * Read the turn number and reason out of one published session log event.
+ *
+ * `append(type, data)` publishes `{ type, seq, time, data }`: the payload is
+ * WRAPPED under `data`. Reading `turn`/`reason` off the event itself yields
+ * undefined, and a settle keyed on `${sessionId}#undefined` never matches the
+ * turn the binder recorded — the card then stays in `running` forever.
+ * @param event - one event as the session log published it.
+ * @returns the turn and its reason, or undefined for anything else.
+ */
+export function readTurnEnd(
+  event: { type?: unknown; data?: { turn?: unknown; reason?: TurnEndLike } } | undefined,
+): { turn: number; reason: TurnEndLike | undefined } | undefined {
+  if (event?.type !== 'turn/end') return undefined
+  const turn = event.data?.turn
+  if (typeof turn !== 'number') return undefined
+  return { turn, reason: event.data?.reason }
+}
+
+/**
+ * The turn ending recorded last in a session's log, or undefined when it has
+ * none yet.
+ *
+ * This is the settle trigger that does not depend on event DELIVERY: an idle
+ * agent can be asked what its log says, and the loop appends `turn/end` before
+ * the agent goes idle. The scan runs backwards so the newest ending wins, and an
+ * event that does not decode is skipped rather than stopping the scan.
+ * @param session - the session whose log to read (anything with a `log` array).
+ * @returns the newest decodable `turn/end`.
+ */
+export function lastTurnEndOf(
+  session: { log?: unknown } | undefined,
+): { turn: number; reason: TurnEndLike | undefined } | undefined {
+  const log = session?.log
+  if (!Array.isArray(log)) return undefined
+  for (let index = log.length - 1; index >= 0; index -= 1) {
+    const end = readTurnEnd(log[index] as { type?: unknown; data?: { turn?: unknown } } | undefined)
+    if (end !== undefined) return end
+  }
+  return undefined
+}
+
 export class SessionBinder {
   private readonly deps: SessionBinderDeps
   /** Prompts currently blocking a turn, keyed by session id (one per session). */

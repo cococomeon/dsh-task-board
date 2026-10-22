@@ -1394,18 +1394,31 @@ export class HostTaskLedger {
       }
     }
     // A card still sitting in the running column whose executions are ALL closed
-    // has missed its settle — a process that died between closing the execution
-    // and moving the column leaves exactly this. No group scan can reach it,
-    // because a group is only collected from executions that are still open, so
-    // without this pass the card stays "running" forever while reporting a
-    // finished verdict: the board refuses to move it (an open execution is what
-    // the manual-move lock tests, and this card has none) and no automatic fold
+    // AND which has not been touched since the last of them closed has missed
+    // its settle — a process that died between closing the execution and moving
+    // the column leaves exactly this. No group scan can reach it, because a
+    // group is only collected from executions that are still open, so without
+    // this pass the card stays "running" forever while reporting a finished
+    // verdict: the board refuses to move it (an open execution is what the
+    // manual-move lock tests, and this card has none) and no automatic fold
     // ever looks at it again.
+    //
+    // "Not touched since" is what keeps this recovery from eating live state.
+    // Being in the running column with a settled execution is also what a card
+    // moved there AFTER its run closed looks like: the session binding pulls a
+    // session's card into running without opening an execution, and a human can
+    // drag a settled card there too. Both stamp `updatedAt` later than
+    // `endedAt`, and both mean "someone put this here on purpose", so they are
+    // skipped. The crash case keeps the opposite ordering — the settle's own
+    // commit writes `updatedAt` and `endedAt` with the same instant, so a
+    // process dying between the two writes leaves them EQUAL and still folds.
     for (const task of this.document.tasks) {
       if (task.status !== 'running' || hasOpenExecution(task)) continue
       const latest = task.executions[task.executions.length - 1]
       const result = latest?.result
       if (result === undefined) continue
+      // Moved after the run closed -> deliberate, not a missed settle.
+      if (task.updatedAt > (latest?.endedAt ?? 0)) continue
       // A parent is still owed its children's verdicts: if any member of its run
       // group is open, the fold above will close it once they land.
       if (latest.runGroupId !== undefined
