@@ -17,6 +17,7 @@ import { HostTaskLedger } from '../src/host-ledger.ts'
 import { SessionChoiceStore } from '../src/host/session-choice.ts'
 import { lastTurnEndOf, readTurnEnd, SessionBinder } from '../src/host/session-binder.ts'
 import { bindingCandidates, settleStatusOf } from '../src/core/session-binding.ts'
+import { hasBusyDescendant, type LiveAgentState } from '../src/core/subagent-tree.ts'
 import { createTask, type ExecutionRecord, type TaskRecord } from '../src/core/tasks.ts'
 
 const NOW = 1_760_000_000_000
@@ -560,6 +561,61 @@ const noSignal = new AbortController()
     { turn: 2, reason: { kind: 'error' } },
   )
   line('idle fallback reads the newest turn/end from the log', lastTurnEndOf({ log }))
+}
+
+// --- P: a turn may not settle while its session still has busy subagents -----
+// The tree is read from session headers (`parentSession`), so it works at every
+// depth; `root` itself is never counted (it is the agent whose turn just ended).
+{
+  const agent = (sessionId: string, parentSession: string | undefined, busy: boolean): LiveAgentState =>
+    ({ sessionId, ...(parentSession === undefined ? {} : { parentSession }), busy })
+
+  // parent idle + child busy
+  assert.equal(hasBusyDescendant('p', [agent('p', undefined, false), agent('c', 'p', true)]), true)
+  line('parent idle + one busy child -> true')
+
+  // the child going idle releases the settle
+  assert.equal(hasBusyDescendant('p', [agent('p', undefined, false), agent('c', 'p', false)]), false)
+  line('same tree, child now idle -> false (the settle may proceed)')
+
+  // multi-level: the grandchild is what keeps it busy
+  assert.equal(
+    hasBusyDescendant('p', [agent('p', undefined, false), agent('c', 'p', false), agent('gc', 'c', true)]),
+    true,
+  )
+  line('grandchild busy -> true (multi-level, not just direct children)')
+
+  // unrelated busy agents do not hold this session's card
+  assert.equal(
+    hasBusyDescendant('p', [agent('p', undefined, false), agent('other', 'elsewhere', true), agent('c', 'p', false)]),
+    false,
+  )
+  line('a busy agent outside the subtree -> false')
+
+  // root's own busy flag is not counted (the question is asked at its turn end)
+  assert.equal(hasBusyDescendant('p', [agent('p', undefined, true)]), false)
+  line('root busy, no children -> false (root excluded)')
+
+  // CYCLES: a corrupted header pointing back at an ancestor must not hang.
+  // (a) child claims root as its parent -> already visited, terminates.
+  assert.equal(hasBusyDescendant('p', [agent('p', 'c', false), agent('c', 'p', true)]), true)
+  // (b) two rows pointing at each other, nobody busy -> terminates, false.
+  assert.equal(hasBusyDescendant('p', [agent('c', 'p', false), agent('p', 'c', false)]), false)
+  // (c) a descendant naming ITSELF as parent -> terminates.
+  assert.equal(hasBusyDescendant('p', [agent('p', undefined, false), agent('c', 'c', true)]), false)
+  // (d) a 3-node ring with one busy member -> still found, still terminates.
+  assert.equal(hasBusyDescendant('p', [agent('p', 'g', false), agent('c', 'p', false), agent('g', 'c', true)]), true)
+  line('cycles (root<->child, self-parent, 3-node ring) terminate with a sane answer')
+
+  // Duplicates are merged pessimistically: a stale idle record can never be
+  // what lets a card settle early.
+  assert.equal(hasBusyDescendant('p', [agent('c', 'p', false), agent('c', 'p', true)]), true)
+  line('duplicate rows: any busy report wins -> true')
+
+  // Degenerate inputs.
+  assert.equal(hasBusyDescendant('', [agent('c', 'p', true)]), false)
+  assert.equal(hasBusyDescendant('p', []), false)
+  line('empty root / empty tree -> false')
 }
 
 process.stdout.write('\nsession-binding: all checks passed\n')

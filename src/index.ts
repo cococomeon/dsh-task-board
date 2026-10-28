@@ -36,6 +36,7 @@ import {
 import { DEFAULT_SESSION_PERMISSION } from './core/handover.ts'
 import { buildTaskBoardTools, callingSessionId, TASK_BOARD_TOOL_NAMES } from './host/agent-tools.ts'
 import { lastTurnEndOf, readTurnEnd, SessionBinder, type TurnEndLike } from './host/session-binder.ts'
+import { hasBusyDescendant, type LiveAgentState } from './core/subagent-tree.ts'
 import { SessionChoiceStore } from './host/session-choice.ts'
 import { PLUGIN_TOOL_SECTION_ORDERS, visibleToolText } from './tool-surface.ts'
 import { makeTaskBoardRoutes } from './host-routes.ts'
@@ -587,6 +588,28 @@ function applyImpl(ctx: Context, config?: Config): void {
     verificationCallTimeoutMs(readConfigField(config?.goalVerificationCallTimeoutSeconds, DEFAULT_VERIFICATION_CALL_TIMEOUT_SECONDS))
   const verificationBudgetMsLive = (): number =>
     verificationBudgetMs(readConfigField(config?.goalVerificationBudgetSeconds, DEFAULT_VERIFICATION_BUDGET_SECONDS))
+  /**
+   * Live agent status per session, from `agent/status` (which EVERY agent's
+   * own loop publishes, subagents included).
+   *
+   * A turn's ending only speaks for the agent that owned it. A subagent runs
+   * its own loop and its own turns, so "the parent's turn is over" is not "the
+   * work is over" — this map plus {@link sessionHasBusyDescendant} is what turns
+   * the session header tree into that missing fact.
+   */
+  const liveAgents = new Map<string, { parentSession?: string; busy: boolean }>()
+  /** Snapshot of {@link liveAgents} in the shape the pure tree walk reads. */
+  const liveAgentStates = (): LiveAgentState[] =>
+    [...liveAgents].map(([sessionId, state]) => ({ sessionId, ...state }))
+  /**
+   * ONE predicate for both settle paths: the conversation binding
+   * (`settleFrom` below) and the runner's execution reconciliation
+   * (`TaskBoardHostService`'s `hasBusyDescendant` option). Two copies would be
+   * two answers to the same question.
+   */
+  const sessionHasBusyDescendant = (sessionId: string): boolean =>
+    hasBusyDescendant(sessionId, liveAgentStates())
+
   // The catalog reader needs the service, and the service needs the reader;
   // the reader only runs after start(), so a late holder is enough.
   let hostForCatalog: TaskBoardHostService | undefined
@@ -612,6 +635,9 @@ function applyImpl(ctx: Context, config?: Config): void {
     verificationSettings,
     verificationCatalog,
     timers: resolveHostTimers(ctx),
+    // A runner-driven run must not settle while the agents its session spawned
+    // are still working (see SessionBinder's module doc and the reader below).
+    hasBusyDescendant: sessionHasBusyDescendant,
     team: buildTeamDispatcher(ctx, config?.teamProvider ?? DEFAULT_TEAM_PROVIDER),
     commandDispatcher: {
       async execute(sessionId, line, signal) {
@@ -766,16 +792,33 @@ function applyImpl(ctx: Context, config?: Config): void {
         const handle = offPreStep as { dispose(): void }
         disposers.push(() => { handle.dispose() })
       }
+      /** A settle held back because the session still had busy descendants. */
+      const deferred = new Map<string, { turn: number; reason: TurnEndLike | undefined }>()
       // The turn's ending is observed through TWO independent signals, because
       // one of them may never arrive: the log event `turn/end`, and the agent's
       // own `idle` transition (where the session log is read directly for the
       // newest `turn/end`). Whichever arrives first settles; the second finds no
       // outstanding claim and does nothing.
+      //
+      // It is also the ONE place a card is settled from a conversation turn, and
+      // it now refuses to settle while session's subagents are still running: a
+      // parent's `turn/end` says the parent stopped talking, not that the work
+      // it delegated is done (observed: a card marked done mid-subagent). The
+      // claim is parked in `deferred` and retried from the `idle` handler.
+      //
+      // KNOWN limitation: an agent that never goes idle (a crash mid-run, a
+      // wedged subagent) leaves its card in `running`. That is the honest
+      // state — the alternative is a card that reports work nobody finished.
       const settleFrom = (
         sessionId: string,
         end: { turn: number; reason: TurnEndLike | undefined } | undefined,
       ): void => {
         if (end === undefined) return
+        if (sessionHasBusyDescendant(sessionId)) {
+          deferred.set(sessionId, end)
+          return
+        }
+        deferred.delete(sessionId)
         binder.afterTurn(sessionId, end.turn, end.reason)
       }
       const disposeOn = (handle: unknown): void => {
@@ -800,18 +843,36 @@ function applyImpl(ctx: Context, config?: Config): void {
         }
       })
       disposeOn(offTurnEnd)
-      const offIdle = ctx.on('agent/status', (payload: { agent?: unknown; status?: unknown }) => {
-        if (payload?.status !== 'idle') return
+      // Every agent reports its own status, subagents included, so this is the
+      // only source for the family tree. BOTH transitions are recorded: a
+      // `running` report is what makes a descendant busy, and recording only
+      // `idle` would leave the walk blind until something finished.
+      const readAgentSession = (agent: unknown): { sessionId?: string; parentSession?: string } => {
+        const header = (agent as { session?: { header?: { parentSession?: unknown } } } | undefined)?.session?.header
+        const parentSession = header?.parentSession
+        const sessionId = callingSessionId({ agent })
+        return {
+          ...(sessionId === undefined ? {} : { sessionId }),
+          ...(typeof parentSession === 'string' && parentSession !== '' ? { parentSession } : {}),
+        }
+      }
+      const offStatus = ctx.on('agent/status', (payload: { agent?: unknown; status?: unknown }) => {
         try {
           const agent = payload.agent as { session?: { log?: unknown } } | undefined
-          const sessionId = callingSessionId({ agent })
+          const { sessionId, parentSession } = readAgentSession(agent)
           if (sessionId === undefined) return
+          const busy = payload?.status === 'running'
+          liveAgents.set(sessionId, { ...(parentSession === undefined ? {} : { parentSession }), busy })
+          if (payload?.status !== 'idle') return
+          // This agent just went idle: its own turn may be the one that owes a
+          // settle, and ANY settle parked because of it can be retried now.
           settleFrom(sessionId, lastTurnEndOf(agent?.session))
+          for (const [waiting, claim] of [...deferred]) settleFrom(waiting, claim)
         } catch (error) {
           warn(ctx, 'task-board: session binding could not settle on idle', error)
         }
       })
-      disposeOn(offIdle)
+      disposeOn(offStatus)
       const routes = makeTaskBoardRoutes(host, resolveProxyAccess(config), {
         parseTask: async (request, signal) => {
           const llm = resolveLlmRuntime(ctx)

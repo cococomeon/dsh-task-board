@@ -193,3 +193,46 @@ T+31.0s done     rev 255   ←────────────  08:39:08.508
 
 1. **轮次死于未记录 `turn/end`**（例如页面被强行关掉、进程被杀）：日志里没有可读的结束记录，`agent-idle` 兜底读到的是**上一轮**的结束（`hasActed:false`），因此那张卡会停在进行中，直到人工拖动或一次真实执行接手。
 2. **`move → running` 与上一次 settle 落在同一毫秒**时 `updatedAt === endedAt`，仍会被判为崩溃残留而折回。实际不会出现（绑定在轮次开始、结算在轮次结束），真撞上表现为「中间态立刻被打回」，不会误判成别的坏结果。
+
+### 10.4 子 agent 仍在跑时不得结算（2026-10-28 新增）
+
+**问题**：父会话这一轮的 `turn/end` 只说明**父 agent 停止说话了**，不说明它派出去的 agent 也结束了。子 agent 有自己的 loop 和自己的轮次。实测在两条路径上都出现过「子 agent 还在跑，卡片已被判完成」。
+
+**规则**：**任意层级**的后代 agent 仍处于 `running` 时，一律不结算，卡片留在「进行中」；最后一个后代转为 `idle` 之后才结算。
+
+判定放在**一处**，两条结算路径共用（`src/core/subagent-tree.ts`）：
+
+```ts
+export function hasBusyDescendant(root: string, agents: Iterable<LiveAgentState>): boolean
+```
+
+- 父子关系取自会话头：`dsh-subagent` 建子会话时写 `parentSession: <父会话头 id>`、`origin: 'subagent'`，因此**多级（子 agent 再派子 agent）**也能判；
+- `root` 自身不计入（问这个问题时它自己的轮次刚结束）；
+- BFS + `visited`（以 root 播种）⇒ 脏数据里的环/自指不会死循环；
+- 同一会话出现多条状态记录时「任一 busy 即 busy」⇒ 陈旧的 idle 记录不能成为提前结算的理由。
+
+| 路径 | 修法 |
+| --- | --- |
+| A 会话绑定 | `settleFrom()` 发现后代 busy ⇒ 只把「待结算」记入 `deferred`；任一 agent 转 `idle` 时遍历 `deferred` 重试，放行后仍是唯一结算入口 `binder.afterTurn()` |
+| B runner 执行 | `reconcileExecutions()` 在 `pending` 分支之后、强制验收与 `settleAndNotify` **之前**：后代 busy ⇒ `continue`（只跳过本轮巡检，执行保持 open，卡片留进行中）；下一轮巡检自然重试 |
+
+活 agent 表来自 `agent/status`（**running 与 idle 两个方向都记录**，payload 的 `agent.session.header` 提供 `parentSession`）。
+
+**真机实测（两条路径都验过）**
+
+```
+路径 B（runner 执行，探针卡 8e8b9548）
+  01:40:04  执行开始
+  01:40:10  父轮结束（父会话最后一次写入）
+  01:42:23  子 agent turn/end (completed)
+  01:42:26  执行结算 succeeded   ← 子 agent 结束后第一次巡检（周期 5s）
+  ⇒ 比「父轮一结束就结算」晚了 142 秒
+
+路径 A（会话绑定，卡 57e04fd8）
+  01:37:51  轮次开始，卡片被拉进进行中
+  01:37:55  子 agent 会话 turn/start
+  01:38:40  子 agent turn/end (completed)
+  01:38:40  卡片结算为已完成       ← 与子 agent 结束同一秒
+```
+
+**已知限制**：子 agent 若永不转为 `idle`（崩溃、被强杀），其父卡会一直停在进行中，直到人工拖动或一次真实执行接手——与 10.3 第 1 条同类，是「诚实状态」而非错误状态。

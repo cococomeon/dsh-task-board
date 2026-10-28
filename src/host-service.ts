@@ -215,6 +215,8 @@ export class TaskBoardHostService {
    * next verification without remounting the plugin row.
    */
   private readonly gitRemote: () => string
+  /** Live reader of "this session still has a busy descendant agent". */
+  private readonly hasBusyDescendant: ((sessionId: string) => boolean) | undefined
   private lastPowerJson = ''
   /** Reader of the turns currently blocked on a binding question (see setBindingSource). */
   private bindingSource: () => readonly TaskBoardBindingPrompt[] = () => []
@@ -268,6 +270,16 @@ export class TaskBoardHostService {
      * per push, so the settings field is editable while the board runs.
      */
     gitRemote?: () => string
+    /**
+     * Whether a session still has a BUSY descendant agent anywhere below it in
+     * the spawn tree. Optional: a deployment that installs no reader keeps the
+     * pre-existing behaviour exactly (a run settles on its own turn's verdict).
+     *
+     * The runner needs it because an execution's session turn ending says
+     * nothing about the subagents that turn spawned — a card settled here while
+     * a subagent still works is a wrong verdict, not a fast one.
+     */
+    hasBusyDescendant?: (sessionId: string) => boolean
   } = {}) {
     this.ledger = options.ledger ?? new HostTaskLedger(undefined, undefined, {
       sessionDefaultPermission: options.sessionDefaultPermission,
@@ -291,6 +303,7 @@ export class TaskBoardHostService {
     this.now = options.now ?? Date.now
     this.goalRunEnabled = options.goalRunEnabled ?? (() => false)
     this.gitRemote = options.gitRemote ?? (() => DEFAULT_GIT_REMOTE)
+    this.hasBusyDescendant = options.hasBusyDescendant
     this.verificationSettings = options.verificationSettings ?? (() => ({ enabled: false, model: '', reasoningEffort: '' }))
     this.verificationCatalog = options.verificationCatalog ?? (async () => undefined)
     this.extensions = new TaskBoardExtensionRegistry({
@@ -901,6 +914,15 @@ export class TaskBoardHostService {
           continue
         }
         this.unreadablePolls.delete(execution.executionId)
+        // The run's own session may have finished its turn while the agents
+        // that turn spawned are still working: a subagent runs its own loop and
+        // its own turns, so a verdict read here would close the card on work
+        // that is still in flight (observed: a card marked done mid-subagent).
+        // Skipping is the whole action — the next poll re-reads the verdict and
+        // settles once the last descendant goes idle. Nothing below this line
+        // (force-acceptance judging included) is affected, and a deployment
+        // without a reader behaves exactly as before.
+        if (this.hasBusyDescendant?.(execution.sessionId) === true) continue
         // Forced acceptance: the old fallback paths — a completed turn, a
         // paused goal, an unreadable projection, a manual settle — must never
         // be mistaken for a verified success. Only a matching pass record
