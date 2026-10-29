@@ -38,8 +38,8 @@
  * @module dsh-task-board/host/session-binder
  */
 import { randomUUID } from 'node:crypto'
-import { BINDING_WAIT_MS, bindingCandidates, settleStatusOf, type SessionCardAssociation } from '../core/session-binding.ts'
-import { hasOpenExecution, type TaskRecord } from '../core/tasks.ts'
+import { BINDING_WAIT_MS, bindingCandidates, settleColumnFor, type SessionCardAssociation } from '../core/session-binding.ts'
+import { canMoveManually, hasOpenExecution, type TaskRecord, type TaskStatus } from '../core/tasks.ts'
 import type { TaskBoardBindingCandidate, TaskBoardBindingPrompt } from '../protocol.ts'
 import type { SessionChoiceStore } from './session-choice.ts'
 
@@ -48,7 +48,7 @@ export interface BindingLedgerFace {
   allTasks(): readonly TaskRecord[]
   getTask(id: string): TaskRecord | undefined
   /** Apply one board action; the same writer every other mutation uses. */
-  applyRequest(requestId: string, action: { kind: 'move'; taskId: string; status: 'running' | 'done' | 'failed' }): unknown
+  applyRequest(requestId: string, action: { kind: 'move'; taskId: string; status: TaskStatus }): unknown
   /**
    * The card this session is currently RUNNING: the open execution whose
    * `sessionId` names it (host-ledger.ts `findOpenExecutionBySession`, the same
@@ -99,6 +99,12 @@ interface ActedTurn {
   sessionId: string
   taskId: string
   turn: number
+  /**
+   * The column the card held before this turn bound it. A turn that ends
+   * without a verdict on record rolls the card back here: a cancellation is a
+   * "we did not get an answer", not a failure to report.
+   */
+  from: TaskStatus
 }
 
 /**
@@ -260,8 +266,13 @@ export class SessionBinder {
     if (task === undefined || task.archivedAt !== undefined) return
     if (task.status !== 'running') return
     if (hasOpenExecution(task)) return
-    const status = settleStatusOf(reason?.kind ?? 'error')
-    this.move(task, status, key, sessionId, turn)
+    const settled = settleColumnFor(task, reason?.kind, acted.from)
+    // A rollback to `verified` cannot be written: the ledger admits only
+    // MANUAL_STATUSES as move targets, and the seal is released by hand alone.
+    // Such a card stays put — re-verification is a human act, never something a
+    // cancelled turn restores.
+    if (settled === acted.from && !canMoveManually(task.status, settled)) return
+    this.move(task, settled, key, sessionId, turn)
   }
 
   /**
@@ -333,7 +344,7 @@ export class SessionBinder {
   /** Move one card through the ledger, recording the action for settle. */
   private move(
     task: SessionCardAssociation['task'],
-    status: 'running' | 'done' | 'failed',
+    status: TaskStatus,
     key: string,
     sessionId: string,
     turn: number,
@@ -350,7 +361,7 @@ export class SessionBinder {
       this.deps.warn?.(`task-board: session binding could not move ${task.id} to ${status}`, error)
       return
     }
-    if (status === 'running') this.acted.set(key, { sessionId, taskId: task.id, turn })
+    if (status === 'running') this.acted.set(key, { sessionId, taskId: task.id, turn, from: task.status })
     else this.acted.delete(key)
   }
 

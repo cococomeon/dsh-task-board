@@ -25,7 +25,7 @@
  *
  * @module @linxin666/dsh-client-ui-task-board/core/session-binding
  */
-import { hasOpenExecution, type TaskRecord, type TaskStatus } from './tasks.ts'
+import { hasOpenExecution, settledStatus, type TaskRecord, type TaskStatus } from './tasks.ts'
 
 /** One card associated with a session, with why and when. */
 export interface SessionCardAssociation {
@@ -150,18 +150,41 @@ export function bindingCandidates(
 /**
  * The column a turn's ending implies for the card it took into `running`.
  *
- * The Host reads `TurnEndReason.kind` from the session log; this maps it onto
- * the board's two settle columns. `completed` is the only kind that means the
- * turn finished its work. Everything else is a real failure to report:
- * `error`, `aborted` (user cancel or parent/hook cancel), `interrupted` (crash
- * orphan), `blocked` (the step was rejected before it ran), `max-tokens` (the
- * step ran out of output budget) and `forked` (a fork closed an open turn).
- * The union is merge-extensible upstream, so an unknown kind also reads as a
- * failure: a card must never be reported as finished on a reason nobody
- * recognizes.
- * @param kind - the reason's discriminant.
+ * The board's rule is that a card follows its LATEST EXECUTION: a run is the
+ * only thing that ever produced a real verdict, and a conversation turn is not
+ * one. A turn that ends `aborted` (the user pressed stop, a parent cancelled),
+ * `blocked`, `max-tokens` or `interrupted` says nothing about the work — while
+ * `succeeded`/`failed` in the execution history says everything. Writing
+ * `failed` from the turn alone is what left re-run-and-succeeded cards sitting
+ * in the failed column.
+ *
+ * So, in order:
+ *
+ * 1. a latest execution with a real verdict (`succeeded` / `failed`) decides,
+ *    through {@link settledStatus} — the ONE place that maps an outcome to a
+ *    column, so a succeeded card with an armed schedule still lands in `todo`;
+ * 2. with no verdict on record, `completed` means the turn finished its work
+ *    (`done`) and `error` means it broke (`failed`);
+ * 3. any other kind is neither: `aborted` (user cancel, parent or hook
+ *    cancel), `blocked`, `max-tokens`, `interrupted`, `forked`, or a kind this
+ *    build does not know. Those roll the card back to `from`, the column it
+ *    held before this turn took it — a cancelled turn is not a failed one;
+ * 4. `undefined` (no reason to read at all) with nothing on record still reads
+ *    as `failed`: an ending nobody can name must not look like success.
+ *
+ * A `cancelled` execution record is not a verdict either (the runner cancels
+ * runs it abandoned, which is the same "nobody judged this work" fact), so it
+ * falls through to the kind rules rather than deciding a column.
+ * @param task - the card, read for its execution history and its schedule.
+ * @param kind - the reason's discriminant, or undefined when none was recorded.
+ * @param from - the column the card held before this turn bound it.
  * @returns the settle column.
  */
-export function settleStatusOf(kind: string): TaskStatus {
-  return kind === 'completed' ? 'done' : 'failed'
+export function settleColumnFor(task: TaskRecord, kind: string | undefined, from: TaskStatus): TaskStatus {
+  const latest = task.executions[task.executions.length - 1]
+  const result = latest?.result
+  if (result === 'succeeded' || result === 'failed') return settledStatus(task, result)
+  if (kind === 'completed') return 'done'
+  if (kind === 'error' || kind === undefined) return 'failed'
+  return from
 }

@@ -236,3 +236,21 @@ export function hasBusyDescendant(root: string, agents: Iterable<LiveAgentState>
 ```
 
 **已知限制**：子 agent 若永不转为 `idle`（崩溃、被强杀），其父卡会一直停在进行中，直到人工拖动或一次真实执行接手——与 10.3 第 1 条同类，是「诚实状态」而非错误状态。
+
+## 十一、结算列跟随最新执行结果
+
+会话绑定原先按 turn/end 的 kind 直接定列（`completed → done`，其余一律 `failed`），于是「失败泳道的卡片重跑成功后又被一轮 `aborted` 打回失败」。现在改由 `core/session-binding.ts` 的 `settleColumnFor(task, kind, from)` 决定，`from` 是这一轮把卡片拉进「进行中」之前它所在的列（记录在 binder 的 `acted` 里）：
+
+| 情况 | 结算列 |
+| --- | --- |
+| 最新一次执行有 verdict（`succeeded` / `failed`） | 按该 verdict，经 `tasks.ts` 的 `settledStatus()` 推导（`succeeded` + 已启用定时 → `todo`，这是既有约定） |
+| 无 verdict + `completed` | `done` |
+| 无 verdict + `error` | `failed` |
+| 无 verdict + 其它 kind（`aborted` / `blocked` / `max-tokens` / `interrupted` / `forked` / 未知） | 回滚到 `from`（用户中断或超预算不是失败） |
+| 无 verdict + kind 为 `undefined` | `failed`（没人解释的结束不能当作完成） |
+
+最新执行若只有 `cancelled`，同样视为「没有 verdict」，走上面的回滚规则。
+
+**已知限制**：`from` 为 `verified` 时纯函数确实返回 `verified`，但账本的手工移动守卫不接受 `verified` 作为目标列（`MANUAL_STATUSES` 不含它，人工验收只能从 `done` 经 verify 动作进入），因此这条回滚**落不了盘**，卡片会停在「进行中」并在宿主日志留一条 warn。要真正恢复该列需要改账本守卫，本模块不具备该权限。
+
+**处置（已落地）**：不再指望账本放行，而是在 binder 里先判定「这次回滚是不是根本没变化」——`settleColumnFor` 返回的列与 `acted.from` 相同且该列不是合法移动目标时，直接不写账本（`src/host/session-binder.ts` 的 `afterTurn` 用 `canMoveManually` 判定）。语义是不改动任何东西：卡片在一轮被取消的对话里既没被判失败、也不会被凭空提升回 `verified`，重新验收仍须人工执行。这样既不产生 warn 噪音，也不需要放宽账本守卫。

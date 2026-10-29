@@ -16,7 +16,7 @@ import { join } from 'node:path'
 import { HostTaskLedger } from '../src/host-ledger.ts'
 import { SessionChoiceStore } from '../src/host/session-choice.ts'
 import { lastTurnEndOf, readTurnEnd, SessionBinder } from '../src/host/session-binder.ts'
-import { bindingCandidates, settleStatusOf } from '../src/core/session-binding.ts'
+import { bindingCandidates, settleColumnFor } from '../src/core/session-binding.ts'
 import { hasBusyDescendant, type LiveAgentState } from '../src/core/subagent-tree.ts'
 import { createTask, type ExecutionRecord, type TaskRecord } from '../src/core/tasks.ts'
 
@@ -45,6 +45,8 @@ function card(
     updatedAt?: number
     /** Overrides the execution's `endedAt` (default: `at + 10`). */
     endedAt?: number
+    /** The recorded verdict of that execution (default `succeeded`). */
+    result?: 'succeeded' | 'failed' | 'cancelled'
   } = {},
 ): TaskRecord {
   const at = options.at ?? NOW
@@ -61,7 +63,7 @@ function card(
       sessionId: options.sessionId,
       startedAt: at,
       endedAt: options.openExecution === true ? undefined : (options.endedAt ?? at + 10),
-      result: options.openExecution === true ? undefined : 'succeeded',
+      result: options.openExecution === true ? undefined : (options.result ?? 'succeeded'),
       error: undefined,
     }
   const task: TaskRecord = {
@@ -229,30 +231,31 @@ const noSignal = new AbortController()
   line('memory naming an archived card -> asked again')
 }
 
-// --- G: turn/end reason -> settle column ------------------------------------
+// --- G: turn/end reason -> settle column, with NO execution verdict --------
+// The card here is associated through `createdBySessionId` only, so its
+// execution history is empty: these are the ends that have no verdict to defer
+// to (see block Q for the ones that do).
 {
-  assert.equal(settleStatusOf('completed'), 'done')
-  for (const kind of ['error', 'aborted', 'blocked', 'max-tokens', 'interrupted', 'forked', 'something-new']) {
-    assert.equal(settleStatusOf(kind), 'failed', `${kind} must fail the card`)
-  }
-  line('reason mapping', { completed: 'done', 'everything else': 'failed' })
-
-  const { ledger, binder } = binderOver()
-  card(ledger, 'turns', { sessionId: SESSION })
-  for (const [turn, reason, expected] of [
-    [1, { kind: 'completed' }, 'done'],
-    [2, { kind: 'aborted', reason: { kind: 'user' } }, 'failed'],
-    [3, { kind: 'error', error: { message: 'boom', code: 'UNKNOWN' } }, 'failed'],
-    [4, { kind: 'max-tokens' }, 'failed'],
-    [5, { kind: 'interrupted' }, 'failed'],
-    [6, { kind: 'blocked' }, 'failed'],
+  for (const [reason, expected] of [
+    [{ kind: 'completed' }, 'done'],
+    [{ kind: 'error' }, 'failed'],
+    // A cancellation is not a failure: the card goes back where it was (`todo`
+    // before this turn took it into running).
+    [{ kind: 'aborted' }, 'todo'],
+    [{ kind: 'max-tokens' }, 'todo'],
+    [{ kind: 'interrupted' }, 'todo'],
+    [{ kind: 'blocked' }, 'todo'],
+    [{ kind: 'forked' }, 'todo'],
   ] as const) {
-    await binder.beforeTurn(SESSION, turn, 1, noSignal.signal)
-    assert.equal(statusOf(ledger, 'turns'), 'running')
-    binder.afterTurn(SESSION, turn, reason)
-    assert.equal(statusOf(ledger, 'turns'), expected, `turn ${turn} (${reason.kind})`)
+    const { ledger, binder } = binderOver()
+    const id = `kind-${reason.kind}`
+    card(ledger, id, { createdBy: SESSION })
+    await binder.beforeTurn(SESSION, 1, 1, noSignal.signal)
+    assert.equal(statusOf(ledger, id), 'running', `${reason.kind}: the turn did not bind the card`)
+    binder.afterTurn(SESSION, 1, reason)
+    assert.equal(statusOf(ledger, id), expected, `${reason.kind} settled the wrong column`)
   }
-  line('turn/end settles every reason kind on a real card')
+  line('no execution record: completed->done, error->failed, every other kind->back to from (todo)')
 }
 
 // --- H: one pass per turn (step 2 and a repeated step 1 are no-ops) ---------
@@ -453,7 +456,10 @@ const noSignal = new AbortController()
   // Its own ledger: a second card in the first block would make the next turn a
   // two-candidate turn, which is a different (already covered) path.
   const { ledger, binder } = binderOver()
-  card(ledger, 'bound-2', { sessionId: SESSION })
+  // Associated without an execution record: with a `succeeded` verdict on
+  // record the execution decides the column and the turn's failure would be
+  // overruled (that is block Q's rule 1, the point of this change).
+  card(ledger, 'bound-2', { createdBy: SESSION })
   await binder.beforeTurn(SESSION, 8, 1, noSignal.signal)
   assert.equal(statusOf(ledger, 'bound-2'), 'running')
   const failedEnd = readTurnEnd({ type: 'turn/end', data: { turn: 8, reason: { kind: 'error' } } })
@@ -616,6 +622,71 @@ const noSignal = new AbortController()
   assert.equal(hasBusyDescendant('', [agent('c', 'p', true)]), false)
   assert.equal(hasBusyDescendant('p', []), false)
   line('empty root / empty tree -> false')
+}
+
+// --- Q: the settle column follows the LATEST EXECUTION ---------------------
+// The reported bug: a card whose last run succeeded was left in the failed
+// column because the turn ended `aborted` — the turn's ending was writing the
+// column while the execution history already carried the real verdict.
+{
+  /** A bare record for the pure cases: the function only reads history + schedule. */
+  const record = (options: {
+    verdict?: 'succeeded' | 'failed' | 'cancelled'
+    scheduled?: boolean
+  }): TaskRecord => {
+    const base = createTask({ title: 'q', description: '', prompt: 'p' }, NOW, 'settle-column')
+    const executions: ExecutionRecord[] = options.verdict === undefined
+      ? []
+      : [{ id: 'exec-q', sessionId: SESSION, startedAt: NOW, endedAt: NOW + 1, result: options.verdict, error: undefined }]
+    return {
+      ...base,
+      status: 'running',
+      executions,
+      ...(options.scheduled === true
+        ? { schedule: { enabled: true, mode: 'cron' as const, cron: '*/5 * * * *' } }
+        : {}),
+    }
+  }
+
+  // 1. latest run succeeded + turn aborted -> done (the online bug).
+  assert.equal(settleColumnFor(record({ verdict: 'succeeded' }), 'aborted', 'running'), 'done')
+  // 2. latest run failed + turn completed -> failed (a completion cannot wash
+  //    out a real failure).
+  assert.equal(settleColumnFor(record({ verdict: 'failed' }), 'completed', 'running'), 'failed')
+  // 3. no verdict + aborted -> back to `from`, whatever it was.
+  assert.equal(settleColumnFor(record({}), 'aborted', 'running'), 'running')
+  assert.equal(settleColumnFor(record({}), 'aborted', 'todo'), 'todo')
+  // 4. no verdict + no reason at all -> failed.
+  assert.equal(settleColumnFor(record({}), undefined, 'running'), 'failed')
+  // 5. rollback is not hard-coded: `verified` comes back as `verified`.
+  assert.equal(settleColumnFor(record({}), 'aborted', 'verified'), 'verified')
+  // 6. the outcome -> column mapping is REUSED from tasks.ts: an armed schedule
+  //    sends a succeeded card to `todo`, and this function inherits that.
+  assert.equal(settleColumnFor(record({ verdict: 'succeeded', scheduled: true }), 'completed', 'running'), 'todo')
+  // A cancelled execution record is not a verdict: it behaves like no record.
+  assert.equal(settleColumnFor(record({ verdict: 'cancelled' }), 'aborted', 'todo'), 'todo')
+  assert.equal(settleColumnFor(record({ verdict: 'cancelled' }), 'completed', 'running'), 'done')
+  line('settleColumnFor: latest verdict wins; cancellation rolls back; schedule reuses settledStatus')
+
+  // The same rule through the real binding + ledger: the bug's exact shape.
+  {
+    const { ledger, binder } = binderOver()
+    card(ledger, 'q-succeeded', { sessionId: SESSION, result: 'succeeded' })
+    await binder.beforeTurn(SESSION, 1, 1, noSignal.signal)
+    assert.equal(statusOf(ledger, 'q-succeeded'), 'running')
+    binder.afterTurn(SESSION, 1, { kind: 'aborted', reason: { kind: 'user' } })
+    assert.equal(statusOf(ledger, 'q-succeeded'), 'done', 'an aborted turn re-failed a succeeded card')
+    line('integration: succeeded run + aborted turn -> done (no more stuck in failed)')
+  }
+  {
+    const { ledger, binder } = binderOver()
+    card(ledger, 'q-failed', { sessionId: SESSION, result: 'failed' })
+    await binder.beforeTurn(SESSION, 1, 1, noSignal.signal)
+    assert.equal(statusOf(ledger, 'q-failed'), 'running')
+    binder.afterTurn(SESSION, 1, { kind: 'completed' })
+    assert.equal(statusOf(ledger, 'q-failed'), 'failed', 'a completed turn washed out a failed run')
+    line('integration: failed run + completed turn -> failed')
+  }
 }
 
 process.stdout.write('\nsession-binding: all checks passed\n')
