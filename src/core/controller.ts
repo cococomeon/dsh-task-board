@@ -67,8 +67,12 @@ export interface TaskBoardTransport {
 export interface SessionsControllerFace {
   /** The Session the main view currently shows, when any. */
   current(): string | undefined
-  /** Navigate the main view to a Session. */
-  open(id: string): void
+  /**
+   * Navigate the main view to a Session. The workspace is passed when the
+   * caller knows it: the shell uses it to unfold exactly that group in the
+   * session list instead of guessing which group holds the session.
+   */
+  open(id: string, workspaceId?: string): void
   /** Subscribe to catalog changes; selection ownership rides the same snapshot. */
   subscribe(fn: () => void): () => void
 }
@@ -743,10 +747,12 @@ export class BoardController {
    * Jump to an execution's session transcript. Selecting the session changes
    * `current`, which closes the board (the conversation view takes over).
    * @param sessionId - the execution session to open.
+   * @param workspaceId - the workspace the session belongs to, when the caller
+   * knows it, so the shell can unfold that group instead of every group.
    */
-  openSession(sessionId: string): void {
+  openSession(sessionId: string, workspaceId?: string): void {
     this.closeBoard()
-    this.deps.sessions.open(sessionId)
+    this.deps.sessions.open(sessionId, workspaceId)
   }
 
   // --- execution ---------------------------------------------------------------

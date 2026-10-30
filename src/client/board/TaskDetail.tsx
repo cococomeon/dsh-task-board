@@ -842,7 +842,7 @@ export function TaskDetail({ controller, task, onVerify, phase = 'open' }: { con
                     key={execution.id}
                     execution={execution}
                     timeZone={timeZone}
-                    onOpen={sessionId => { controller.openSession(sessionId) }}
+                    onOpen={sessionId => { controller.openSession(sessionId, current.workspaceId) }}
                   />
                 ))}
               </ul>

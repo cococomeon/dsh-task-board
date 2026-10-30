@@ -125,8 +125,11 @@ function TaskCardInner({
   pending: boolean
   timeZone?: string
   onClick: () => void
-  /** Open an execution session; absent renders the session mark inert. */
-  onOpenSession?: (sessionId: string) => void
+  /**
+   * Open an execution session; absent renders the session mark inert. The
+   * workspace rides along so the shell unfolds that one group for the jump.
+   */
+  onOpenSession?: (sessionId: string, workspaceId?: string) => void
   /** A double click found no linked session; the board reports it. */
   onMissingSession?: () => void
   /** Open the human verification dialog; absent renders no verify control. */
@@ -169,6 +172,9 @@ function TaskCardInner({
   // One derivation for the entry and the double-click, so the two can never
   // disagree about whether this card has a session to open.
   const sessionId = cardSessionId(task)
+  // The session lives in the workspace the run was pinned to; the shell unfolds
+  // that group so the jumped-to row is visible instead of folded away.
+  const workspaceId = task.workspaceId
   // What the session is doing right now outranks the execution-derived label:
   // "blocked on your approval" and "working" are different facts, and only the
   // session runtime knows which one holds.
@@ -193,7 +199,7 @@ function TaskCardInner({
   sinks.current = { openDetail: onClick, openSession: onOpenSession, notifyNoSession: onMissingSession }
   const activation = useMemo(() => createCardActivation({
     openDetail: () => { sinks.current.openDetail() },
-    openSession: session => { sinks.current.openSession?.(session) },
+    openSession: session => { sinks.current.openSession?.(session, workspaceId) },
     notifyNoSession: () => { sinks.current.notifyNoSession?.() },
   }), [])
   // A window must not outlive its card: the board filters, folds and re-renders
@@ -226,7 +232,7 @@ function TaskCardInner({
       data-dsh-part="card-session"
       title={t('card.openSession')}
       aria-label={t('card.openSession')}
-      onClick={() => { onOpenSession(sessionId) }}
+      onClick={() => { onOpenSession(sessionId, workspaceId) }}
     >
       <IconSession size={14} />
     </button>

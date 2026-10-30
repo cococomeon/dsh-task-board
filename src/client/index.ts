@@ -27,6 +27,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
 import { BoardController, TASK_BOARD_PANEL_ID, type SessionsControllerFace } from '../core/controller.ts'
 import { collectSessionRuntimeStates, type SessionRuntimeFacts } from '../core/session-state.ts'
 import { mainViewSessionId } from './main-session.ts'
+import { createSessionReveal } from './session-reveal.ts'
 import { LocalStorageTaskStore } from '../core/store.ts'
 import { claimTaskboardApply, releaseTaskboardApply } from './apply-guard.ts'
 import { registerTaskBoardPanel } from './native-panel.tsx'
@@ -261,6 +262,15 @@ export function apply(ctx: ClientContext): void {
 
     // Core wiring: real runtime faces into the framework-free services.
     const store = new LocalStorageTaskStore()
+    // Every jump to a session — the card double click and the conversation
+    // title-bar button both land here — also reveals the session in the left
+    // sidebar: a selection alone leaves a collapsed workspace group, an
+    // unrendered row, or a closed column hiding it. The faces stay lazy so a
+    // jump never depends on the layout or workspace plugin settling first.
+    const revealSession = createSessionReveal({
+      layout: () => ctx.get('layout') as { toggleSidebar?: () => void } | undefined,
+      workspace: () => ctx.uiWorkspace as { openSession: (id: string) => void } | undefined,
+    })
     // One session face, shared by the controller and the title-bar button, so
     // "which session is the main view on" is derived in exactly one place.
     const sessionFace: SessionsControllerFace = {
@@ -268,7 +278,7 @@ export function apply(ctx: ClientContext): void {
       // counts; navigation belongs to the workspace UI since the
       // multi-instance Client Session model.
       current: () => mainViewSessionId(sessions.list.getSnapshot().byId),
-      open: id => ctx.uiWorkspace.openSession(id as never),
+      open: (id, workspaceId) => revealSession(id, workspaceId),
       subscribe: fn => sessions.list.subscribe(fn),
     }
     const controller = new BoardController({

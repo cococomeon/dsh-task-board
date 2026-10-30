@@ -23,7 +23,7 @@
 | 场景 | 行为 |
 | --- | --- |
 | 单击卡片 | 打开任务详情浮层（**改造前语义不变**） |
-| 双击卡片（250ms 窗口内两次点击） | 跳到关联会话；**不**打开详情浮层 |
+| 双击卡片（250ms 窗口内两次点击） | 跳到关联会话，并把该会话在其工作区分组里**展开 + 滚动到视口内**；**不**打开详情浮层 |
 | 键盘激活卡片（Enter/Space） | **立即**打开详情，不受 250ms 窗口影响 |
 | 双击但无关联会话 | 不动作，显示非阻塞提示（`role="status"`，约 2.5s 自动消失，零布局位移） |
 | 会话按钮：1 张关联卡片 | 直接打开看板并定位该卡片 |
@@ -33,6 +33,19 @@
 | 会话按钮的可发现性 | 按钮恒带 1px `border-l3` 描边（标题栏其它图标没有），否则纯图标「静止即隐形」；置灰色用 `label-tertiary`（浅色主题 `#81858c`，对白底约 3.7:1），**不要用 `label-dimmed`（`#e1e5ee`，约 1.2:1，等于看不见）**；活动态用 `label-secondary`（`#61666b`，约 5.9:1） |
 
 `250ms` 窗口实现在 `src/client/board/card-activation.ts`（`CARD_DOUBLE_CLICK_MS`），单元可测。
+
+### 侧边栏联动（跳到会话之后）
+
+只把会话选中并不等于让用户**看见**它：会话列表按工作区分组，分组可能被折叠、组内行数可能被截断、整个侧边栏列也可能收起。因此跳转统一经过 `src/client/session-reveal.ts` 的 `createSessionReveal`，做三件事：
+
+1. **侧边栏收起时展开**：读渲染帧上的 `[data-sidebar-collapsed]`，命中才调 `ctx.layout.toggleSidebar()`；没有该标记（非 shell 宿主）一律不动，避免把已经开着的侧边栏关掉。布局服务只暴露 toggle、没有 setter 与 getter，所以只能靠帧标记判态。
+2. **只展开目标所在的那一个工作区分组**：卡片把 `task.workspaceId` 一路带到 `sessionFace.open(id, workspaceId)`，据此定位 `[data-row-key="workspace:<workspaceId>"]` 并点击展开，**其余分组的折叠状态保持不动**（折叠是用户的，跳转不该把它打散）。工作区未知时（例如详情浮层里没有 pin 目标）才退化为展开所有折叠组——折叠组不渲染任何行，纯 DOM 无法判断哪一组藏着目标会话。
+3. **滚动到视口内**：行出现后 `scrollIntoView({ block: 'nearest' })`，每次跳转只做一次（行自己的 reveal 是 React effect，只有侧边栏内部导航才会触发，外部跳转不会有任何滚动）。
+
+三趟 `setTimeout(fn, 0)` 分帧：展开 → 等一次渲染再确认 → 滚动，用一个 pending token 去重，连点两次只留最后一次。
+
+DOM 契约（实测，写死在 `session-reveal.ts` 顶部）：分组头 `data-row-key="workspace:<workspaceId>"` + `aria-expanded`，会话行 `data-row-key="session:<sessionId>"`，区域为 `role="tree"/"treeitem"`。
+
 
 ## 三、改动清单（相对官方 0.4.6）
 
@@ -47,7 +60,8 @@
 浏览器半：
 
 - `client/board/card-view.ts`（`cardSessionId`）、`client/board/card-activation.ts`（新增，250ms 状态机）、`client/board/TaskCard.tsx`（双击接线、紧凑密度也渲染会话入口、快捷动作早退时取消窗口）、`client/board/TaskBoard.tsx`（提示条）、`client/board.module.css`、`client/locales.ts`（zh/en）；
-- `client/session-cards.ts`（新增，反向查找/排序/决策）、`client/SessionBoardLink.tsx`（新增，标题栏按钮 + 弹层 + 席位注册）、`client/session-link.module.css`（新增）、`client/index.ts`（注册接线 + 会话 face 单例化）、`core/controller.ts`（**唯一一处**：`createTaskConfirmed` 把当前会话填进 `input.createdBySessionId`）。
+- `client/session-cards.ts`（新增，反向查找/排序/决策）、`client/SessionBoardLink.tsx`（新增，标题栏按钮 + 弹层 + 席位注册）、`client/session-link.module.css`（新增）、`client/index.ts`（注册接线 + 会话 face 单例化）、`core/controller.ts`（**两处**：`createTaskConfirmed` 把当前会话填进 `input.createdBySessionId`；`SessionsControllerFace.open` / `openSession` 增加可选 `workspaceId`，供侧边栏只展开目标分组）；
+- `client/session-reveal.ts`（新增，跳转后展开目标工作区分组 + 滚动到视口内）、`client/board/TaskCard.tsx`（把 `task.workspaceId` 带给双击与会话入口）、`client/board/TaskDetail.tsx`（执行记录行跳转带上 `current.workspaceId`）。
 
 数据库/协议：**不升 `schemaVersion`**（保持 6）。证据：校验器不拒绝未知键；`parseLedger` 是展开+逐字段修复而非重建；旧 v6 文档与含新字段的文档双向兼容。
 
@@ -111,6 +125,8 @@ cd $P && pnpm install
   - 紧凑密度下会话入口存在（改造前缺失）；
   - 会话按钮：1 张 → 直接跳到该卡详情；7 张 → `role="menu"` 面板 7 项、点选后跳转并关面板；0 张 → 置灰可聚焦、点击无动作；
   - **正向端到端**：双击一张「从未执行、只靠 `createdBySessionId` 关联」的卡片 → 跳到它的创建会话。
+  - **侧边栏联动端到端**：先把 16 个工作区分组**全部**折叠（`aria-expanded` 全为 `false`），再双击 `space5` 的卡片 → 跳转后**只有 `space5`** 变为 `true`，其余 15 组仍为 `false`；目标行 `session:session-97b6e942-…` 出现且 `getBoundingClientRect()` 落在视口内（top 517 / bottom 549，视口高 720）。
+    - 首版实现曾用 `querySelector('[data-row-key^="workspace:"]')` 取**第一个**分组，实测第一个恰为已展开的「默认工作区」⇒ 未点击、`space5` 始终折叠、行不出现。改为按 `workspaceId` 精确定位后才通过；这一条是实测抓到的，不是推断。
 
 ## 九、已知限制
 

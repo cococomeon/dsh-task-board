@@ -261,7 +261,9 @@ export function TaskBoard({ controller }: { controller: BoardController }) {
       : [...current, name])
   }, [])
   const openTask = useCallback((id: string): void => { controller.openTask(id) }, [controller])
-  const openSession = useCallback((sessionId: string): void => { controller.openSession(sessionId) }, [controller])
+  const openSession = useCallback((sessionId: string, workspaceId?: string): void => {
+    controller.openSession(sessionId, workspaceId)
+  }, [controller])
   // Stable for the memoized cards: a fresh callback would re-render every card
   // on the board on each snapshot.
   const notifyNoSession = useCallback((): void => { setNoSessionNotice(token => token + 1) }, [])
