@@ -270,6 +270,9 @@ export function apply(ctx: ClientContext): void {
     const revealSession = createSessionReveal({
       layout: () => ctx.get('layout') as { toggleSidebar?: () => void } | undefined,
       workspace: () => ctx.uiWorkspace as { openSession: (id: string) => void } | undefined,
+      // The sidebar search matches titles, never ids, so the reveal needs the
+      // title the catalog derived for this session.
+      title: id => sessions.list.getSnapshot().byId[id]?.title,
     })
     // One session face, shared by the controller and the title-bar button, so
     // "which session is the main view on" is derived in exactly one place.

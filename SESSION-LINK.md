@@ -36,15 +36,30 @@
 
 ### 侧边栏联动（跳到会话之后）
 
-只把会话选中并不等于让用户**看见**它：会话列表按工作区分组，分组可能被折叠、组内行数可能被截断、整个侧边栏列也可能收起。因此跳转统一经过 `src/client/session-reveal.ts` 的 `createSessionReveal`，做三件事：
+只把会话选中并不等于让用户**看见**它。实测侧边栏有**三种互相独立**的隐藏机制，必须全部击破：
 
-1. **侧边栏收起时展开**：读渲染帧上的 `[data-sidebar-collapsed]`，命中才调 `ctx.layout.toggleSidebar()`；没有该标记（非 shell 宿主）一律不动，避免把已经开着的侧边栏关掉。布局服务只暴露 toggle、没有 setter 与 getter，所以只能靠帧标记判态。
-2. **只展开目标所在的那一个工作区分组**：卡片把 `task.workspaceId` 一路带到 `sessionFace.open(id, workspaceId)`，据此定位 `[data-row-key="workspace:<workspaceId>"]` 并点击展开，**其余分组的折叠状态保持不动**（折叠是用户的，跳转不该把它打散）。工作区未知时（例如详情浮层里没有 pin 目标）才退化为展开所有折叠组——折叠组不渲染任何行，纯 DOM 无法判断哪一组藏着目标会话。
-3. **滚动到视口内**：行出现后 `scrollIntoView({ block: 'nearest' })`，每次跳转只做一次（行自己的 reveal 是 React effect，只有侧边栏内部导航才会触发，外部跳转不会有任何滚动）。
+1. **整列收起**：外壳在收起时给栅格容器加 `[data-sidebar-collapsed]`。
+2. **分组折叠**：工作区分组 `aria-expanded="false"` 时不渲染任何会话行。
+3. **组内行数上限**（最容易被忽略的一种）：每个分组只渲染一个有界窗口（初始约 5–6 行），其余藏在一个「展开其余 N 个会话」按钮后面，**每点一次只多 5 行**。`默认工作区` 实测有 128 个会话，而华夏那张卡关联的会话按时间排**第 95 位**——初始窗口里根本没有这一行，点多少次分组都点不出来，硬扛按钮则需要约 18 次点击。
 
-三趟 `setTimeout(fn, 0)` 分帧：展开 → 等一次渲染再确认 → 滚动，用一个 pending token 去重，连点两次只留最后一次。
+> 这是"已验证列点华夏卡片、左边工作区没反应"的真正原因。v1 只处理了机制 1、2，所以对第 95 位的会话必然无效。
 
-DOM 契约（实测，写死在 `session-reveal.ts` 顶部）：分组头 `data-row-key="workspace:<workspaceId>"` + `aria-expanded`，会话行 `data-row-key="session:<sessionId>"`，区域为 `role="tree"/"treeitem"`。
+因此跳转统一经过 `src/client/session-reveal.ts` 的 `createSessionReveal`，改为**借用侧边栏自己的搜索展开通路**：
+
+- 侧边栏自己的搜索命中后走的是 `openSearchResult()`：它把目标会话记进 `revealSessionId`，`SessionTree` 随即自动**展开全部祖先分组**、把该组的行数上限**提到 `Infinity`**、`scrollIntoView` 滚动，最后清空 reveal id。这正是我们需要的三步，且是宿主官方实现，不依赖内部 state 直连。
+- 我们的 reveal 于是：展开侧边栏（机制 1）→ 打开搜索框（点 `button[aria-label="搜索会话"]`）→ 把**会话标题**写进 `input[placeholder="搜索会话名称"]`（用原生 setter + `input` 事件，否则 React 受控组件收不到）→ 点第一个搜索结果行。
+- 关键约束：**搜索只匹配标题与工作区名，从不匹配会话 id**。查询会话 id 会得到空结果。标题由 catalog 派生（`sessions.list.getSnapshot().byId[id].title`），卡片里没有，所以 `createSessionReveal` 的 deps 增加 `title(sessionId)`。
+- 搜索结果行**不是**会话树行：它由另一个组件渲染，用 `searchResultRow` 类、**没有 `data-row-key`**，因此搜索态下无法按 id 认行，只能靠查询词选中、取第一条。
+
+回落：若目标行其实已在渲染窗口内（`[data-row-key="session:<id>"]` 存在），直接 `scrollIntoView`，不打扰搜索框与用户的折叠状态。
+
+三趟 `setTimeout(fn, 0)` 分帧（等搜索框展开渲染 → 等结果渲染 → 激活），用 pending token 去重，连点两次只留最后一次；在上面两条通路（搜索 / 直接滚动）之间是幂等的。
+
+DOM 契约（实测，写死在 `session-reveal.ts` 顶部）：搜索框 `input[placeholder="搜索会话名称"]`、搜索开关 `button[aria-label="搜索会话"]`、搜索结果行 `[role="treeitem"][class*="searchResultRow"]`；正常树态分组头 `data-row-key="workspace:<workspaceId>"` + `aria-expanded`、会话行 `data-row-key="session:<sessionId>"`、区域 `role="tree"/"treeitem"`。
+
+验收（实测，浏览器内对着华夏那张卡点的「打开关联会话」）：
+- 修复前：分组已全部 `aria-expanded="true"`，华夏会话仍无 DOM 行；点「展开其余 61 个会话」只从 40 行涨到 45 行。
+- 修复后：点一次卡片入口，`[data-row-key="session:session-582eb17c-…"]` 出现，`visible=true`、`top=517`、`aria-selected="true"`，会话行总数由 6 变成 101，搜索框已清空并回到正常「会话」树。
 
 
 ## 三、改动清单（相对官方 0.4.6）
