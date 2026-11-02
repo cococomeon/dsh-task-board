@@ -758,7 +758,10 @@ export class HostTaskLedger {
       })
     }
 
-    const next = nextRunAtMs(schedule.cron ?? '', schedule.nextRunAt ?? triggeredAt, scheduleZone(schedule))
+    // Roll from the firing instant, never from the stale target: a rule that
+    // came due hours late would otherwise advance one occurrence per tick and
+    // stay in the past, where no armed timer can ever reach it again.
+    const next = nextRunAtMs(schedule.cron ?? '', triggeredAt, scheduleZone(schedule))
     if (next === undefined) {
       this.progressSchedule(taskId, { consumed: 0, endedReason: 'no-target' }, triggeredAt)
       return []
@@ -787,7 +790,9 @@ export class HostTaskLedger {
       this.progressSchedule(taskId, { consumed: 0, endedReason: reason }, now)
       return
     }
-    const next = nextRunAtMs(schedule.cron ?? '', schedule.nextRunAt ?? now, scheduleZone(schedule))
+    // Same roll-from-now rule as openScheduled: a skipped or refused occurrence
+    // must land the rule in the future, or the target is unreachable.
+    const next = nextRunAtMs(schedule.cron ?? '', now, scheduleZone(schedule))
     if (next === undefined) this.progressSchedule(taskId, { consumed: 0, endedReason: 'no-target' }, now)
     else this.progressSchedule(taskId, { consumed: 0, nextRunAt: next, skippedReason: reason }, now)
   }

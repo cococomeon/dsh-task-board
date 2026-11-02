@@ -109,8 +109,14 @@ export interface ScheduledRunContext {
 /**
  * Actions that can move an armed trigger. Only these re-arm the native timer;
  * an unrelated card edit leaves the pending fire untouched.
+ *
+ * `create` and `update` belong here because both carry a rule: a card created
+ * with an hourly schedule, and one whose schedule is added or changed from the
+ * card editor, must arm at once. Without them a freshly written rule armed no
+ * timer at all — it sat at its target until some unrelated schedule write or a
+ * Host restart happened to re-arm, which is exactly "the schedule never fires".
  */
-const SCHEDULE_WRITE_ACTIONS: ReadonlySet<TaskBoardAction['kind']> = new Set(['set-schedule', 'delete', 'archive'])
+const SCHEDULE_WRITE_ACTIONS: ReadonlySet<TaskBoardAction['kind']> = new Set(['create', 'update', 'set-schedule', 'delete', 'archive'])
 
 /**
  * The git remote a verification pushes to unless the deployment names another:
@@ -1106,7 +1112,14 @@ export class TaskBoardHostService {
   private armSchedule(): void {
     if (this.disposed || !this.active) return
     this.clearScheduleTimer()
-    const target = this.ledger.nextArmedRunAt(this.now())
+    const now = this.now()
+    // An overdue rule is never a future target, so a board that lost a fire (a
+    // timer cleared by a reload, a suspended process, a rule written without a
+    // re-arm) would otherwise arm nothing and stay silent until some unrelated
+    // rule came due. Servicing it now is the difference between "late" and
+    // "never": the boot path has already skipped what it must not replay.
+    const target = this.ledger.nextArmedRunAt(now)
+      ?? (this.ledger.dueSchedules(now).length > 0 ? now : undefined)
     if (target === undefined) return
     this.scheduleTarget = target
     const delay = Math.max(0, Math.min(target - this.now(), MAX_TIMER_DELAY_MS))
@@ -1190,6 +1203,14 @@ export class TaskBoardHostService {
 
   private schedulePoll(): void {
     if (this.pollInFlight || this.disposed) return
+    // Safety net for the armed trigger: the poll already runs on a fixed
+    // cadence, so a timer that went missing (a fiber disposed by a reload
+    // without re-arming the board, a lost handle, a cleared timeout) is
+    // restored within one cadence instead of leaving every rule silent until
+    // some unrelated schedule write or a Host restart. A live timer is left
+    // untouched — arming clears and re-creates it, which would keep pushing
+    // the pending fire back by one cadence at a time.
+    if (this.scheduleTimer === undefined) this.armSchedule()
     this.pollInFlight = true
     void this.pollSessions().then((rosterReadable) => {
       // A pass that could not read the roster is a failure even though it
