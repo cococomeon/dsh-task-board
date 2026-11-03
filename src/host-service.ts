@@ -3,14 +3,14 @@ import type { Workspace } from '@deepseek-ai/dsh-workspace/types'
 import { DEFAULT_SESSION_POLL_SECONDS, normalizeSessionPollSeconds, sessionPollMs } from './core/poll-cadence.ts'
 import { reusableSessionId } from './core/session-reuse.ts'
 import { HostTaskLedger, type OpenedRun, type OpenExecutionReference } from './host-ledger.ts'
-import { HostExecutionRunner, SessionLaunchError, promptText, type SessionCommandDispatcher, type SessionSummary, type TaskBoardWorkspaceGate, type TaskBoardWorkspaceRegistry, type TaskBoardWorkspaceGuard } from './host-runner.ts'
+import { HostExecutionRunner, SessionLaunchError, promptText, type SessionCommandDispatcher, type SessionSummary, type TaskBoardPeerSource, type TaskBoardWorkspaceGate, type TaskBoardWorkspaceRegistry, type TaskBoardWorkspaceGuard } from './host-runner.ts'
 import { teammateName } from './core/subtask.ts'
 import { mostRecentWorkspaceId, workspaceOwningSession } from './core/workspace-target.ts'
 import { PowerInhibitor } from './power-inhibitor.ts'
 import { TASK_BOARD_SCHEMA_VERSION, type TaskBoardAction, type TaskBoardBindingPrompt, type TaskBoardEventPayload, type TaskBoardSnapshot } from './protocol.ts'
 import { TaskBoardExtensionRegistry } from './host/extension-registry.ts'
 import type { TaskBoardExtension } from './core/extension.ts'
-import { canVerifyTask, hasOpenExecution, type ExecutionOutcome, type ScheduleMode, type TaskRecord, type TaskStatus } from './core/tasks.ts'
+import { appendTaskWarning, canVerifyTask, hasOpenExecution, type ExecutionOutcome, type ScheduleMode, type TaskRecord, type TaskStatus, type TaskWarning } from './core/tasks.ts'
 import { runGitSync } from './host/git-gerrit.ts'
 import { passedAttempt, resolveContract, verificationNeverInvoked, verificationOnlyInvalid, verificationRequired, withAcceptanceDetailCleared, type ExecutionVerification, type ModelCatalogView, type VerificationContract, type VerificationSettings } from './core/verification.ts'
 import type { TaskPermission } from './core/handover.ts'
@@ -286,6 +286,12 @@ export class TaskBoardHostService {
      * a subagent still works is a wrong verdict, not a fast one.
      */
     hasBusyDescendant?: (sessionId: string) => boolean
+    /**
+     * Mints the in-process Peer every gateway call of the runner travels as.
+     * Absent keeps the former request shape, which a gateway that requires a
+     * live Peer answers with an error instead of a result.
+     */
+    peerSource?: TaskBoardPeerSource
   } = {}) {
     this.ledger = options.ledger ?? new HostTaskLedger(undefined, undefined, {
       sessionDefaultPermission: options.sessionDefaultPermission,
@@ -301,7 +307,7 @@ export class TaskBoardHostService {
         this.ledger.saveTaskRecord({ ...task, workspaceId })
       },
     }
-    this.runner = new HostExecutionRunner(gateway, options.commandDispatcher, options.workspaceRegistry, undefined, workspaceGuard)
+    this.runner = new HostExecutionRunner(gateway, options.commandDispatcher, options.workspaceRegistry, undefined, workspaceGuard, options.peerSource)
     this.workspaceRegistry = options.workspaceRegistry
     this.team = options.team
     this.timers = options.timers ?? PROCESS_TIMERS
@@ -767,7 +773,17 @@ export class TaskBoardHostService {
       if (schedule !== undefined && attached === undefined && launchedSession === undefined) {
         this.ledger.refundScheduledOccurrence(opened.task.id, this.now())
       }
-      this.settleAndNotify(opened.task.id, opened.execution.id, 'failed', error instanceof Error ? error.message : String(error))
+      const reason = error instanceof Error ? error.message : String(error)
+      // The settlement column already says the run failed, but a failed launch
+      // leaves no session and no transcript: without this line the card is the
+      // only place the reason could live, and it would live there as a bare
+      // message that the next run's success silently overwrites.
+      this.warnTask(opened.task.id, {
+        code: 'launch-failed',
+        message: `本次启动失败：${reason}`,
+        executionId: opened.execution.id,
+      })
+      this.settleAndNotify(opened.task.id, opened.execution.id, 'failed', reason)
     }
   }
 
@@ -836,6 +852,17 @@ export class TaskBoardHostService {
     const running = await this.runner.listRunning()
     const previous = this.power.snapshot()
     if (!running.known) {
+      // The cards this pass cannot reconcile are exactly the open executions:
+      // each one keeps its column instead of settling, so each one must carry
+      // the reason rather than look like a run that is merely slow.
+      for (const execution of runtime.openExecutions) {
+        this.warnTask(execution.taskId, {
+          code: 'session-roster-unreadable',
+          message: `无法读取会话列表（${running.reason}），本轮无法判定该运行的状态，已按退避重试`,
+          executionId: execution.executionId,
+          ...(running.detail === undefined ? {} : { detail: running.detail }),
+        })
+      }
       this.power.updateReasons({
         runningSessions: previous.runningSessions,
         armedSchedules: runtime.armedSchedules,
@@ -887,7 +914,17 @@ export class TaskBoardHostService {
       safeConsoleError('[dsh-task-board] session roster read for session reuse failed; starting a fresh session', error)
       return undefined
     }
-    if (!running.known) return undefined
+    if (!running.known) {
+      // The card asked to continue an earlier conversation and the board cannot
+      // tell whether that session is idle. Starting fresh is the safe answer,
+      // but it is not the answer the card asked for, so the card says so.
+      this.warnTask(task.id, {
+        code: 'session-roster-unreadable',
+        message: `无法读取会话列表（${running.reason}），本次改用全新会话运行，未能复用上一轮对话`,
+        ...(running.detail === undefined ? {} : { detail: running.detail }),
+      })
+      return undefined
+    }
     return reusableSessionId(task, new Set(running.items.filter(item => !item.running).map(item => item.sessionId)))
   }
 
@@ -1221,6 +1258,37 @@ export class TaskBoardHostService {
       this.notePollFailure()
       safeConsoleError('[dsh-task-board] session polling failed', error)
     }).finally(() => { this.pollInFlight = false })
+  }
+
+  /**
+   * Leave a durable trace on the card of something that did not go as the card
+   * said it would.
+   *
+   * A degraded decision (an unreadable session roster, a reuse that could not
+   * be answered, a substitution for a target the card pinned) used to happen
+   * silently: the run went on, the card looked normal, and the only evidence
+   * was a console line nobody reads later. The card is where the user looks, so
+   * the trace belongs on the card record.
+   *
+   * Repeat suppression: the same code with the same message is written once.
+   * The roster poll retries on a backing-off cadence and would otherwise fill
+   * the bounded warning list with one identical line per pass.
+   * @param taskId - the card the warning belongs to.
+   * @param warning - what diverged from expectation.
+   */
+  private warnTask(taskId: string, warning: Omit<TaskWarning, 'id' | 'at'>): void {
+    const task = this.ledger.getTask(taskId)
+    if (task === undefined) return
+    const existing = task.warnings ?? []
+    if (existing.some(entry => entry.code === warning.code && entry.message === warning.message)) return
+    this.ledger.saveTaskRecord({
+      ...task,
+      warnings: appendTaskWarning(existing, {
+        ...warning,
+        id: `warn-${this.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+        at: this.now(),
+      }),
+    })
   }
 
   /**

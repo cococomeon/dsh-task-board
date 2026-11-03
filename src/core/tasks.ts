@@ -503,6 +503,67 @@ export interface TaskRecord {
    * absent means on-board.
    */
   hidden?: boolean
+  /**
+   * Anything the Host observed that did not match what the card asked for, kept
+   * ON the card so it stays visible where the work is, instead of only in a
+   * Host console the user never opens.
+   *
+   * Append-only and bounded (see {@link TASK_WARNING_LIMIT}); absent on every
+   * card that has never degraded, which is also every card written before the
+   * field existed. A warning never changes a column: it records what happened,
+   * it does not decide an outcome.
+   */
+  warnings?: TaskWarning[]
+}
+
+/**
+ * One recorded discrepancy between what the card asked for and what the Host
+ * could actually do.
+ *
+ * The Host writes one wherever it degrades a decision instead of failing the
+ * run: an unreadable session roster that forces a fresh session, a reuse probe
+ * that could not be answered, a launch that fell back to something other than
+ * what the card pinned. Failing the run is not the only silent option, and a
+ * `console.warn` is not a record: the user reads the board, so the board
+ * carries the note.
+ */
+export interface TaskWarning {
+  /** Stable id, so the UI can key rows and one note cannot displace another. */
+  id: string
+  /** When the Host observed it (ms epoch). */
+  at: number
+  /** Short machine-readable kind, e.g. `session-roster-unreadable`. */
+  code: string
+  /** One plain sentence: what differed, and what the Host did instead. */
+  message: string
+  /** The execution this concerns, when it happened during a run. */
+  executionId?: string
+  /** The raw failure text, when there was one (bounded, never a stack dump). */
+  detail?: string
+}
+
+/**
+ * Maximum warnings retained per card. The newest are kept: an old note about a
+ * condition that has since recovered is worth less than the latest one, and a
+ * repeating failure (a cron card firing every hour) must not grow the ledger
+ * without bound.
+ */
+export const TASK_WARNING_LIMIT = 10
+
+/**
+ * Append one warning, keeping the list bounded and the newest last.
+ * @param existing - the card's current warnings.
+ * @param warning - the note to add.
+ * @param limit - retention cap (defaults to {@link TASK_WARNING_LIMIT}).
+ * @returns the bounded list to store on the card.
+ */
+export function appendTaskWarning(
+  existing: readonly TaskWarning[] | undefined,
+  warning: TaskWarning,
+  limit: number = TASK_WARNING_LIMIT,
+): TaskWarning[] {
+  const merged = [...(existing ?? []), warning]
+  return merged.length <= limit ? merged : merged.slice(merged.length - limit)
 }
 
 /**

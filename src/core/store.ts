@@ -10,7 +10,7 @@
  * localStorage backend.
  */
 import { isValidCron, isValidTimeZone } from './schedule.ts'
-import { SCHEDULE_STOP_REASONS, isTaskPermission, isTaskStatus, normalizeTags, normalizeTargetId, type ScheduleRule, type ScheduleStopReason, type TaskFreeze, type TaskRecord, type TaskPermission, type TaskStatus } from './tasks.ts'
+import { SCHEDULE_STOP_REASONS, TASK_WARNING_LIMIT, isTaskPermission, isTaskStatus, normalizeTags, normalizeTargetId, type ScheduleRule, type ScheduleStopReason, type TaskFreeze, type TaskRecord, type TaskPermission, type TaskStatus, type TaskWarning } from './tasks.ts'
 import { isExecutionOutcome } from './subtask.ts'
 import type { TaskHandover } from './handover.ts'
 import { sanitizeFreezeSnapshot } from './freeze-snapshot.ts'
@@ -111,6 +111,39 @@ function normalizeStatus(status: unknown): TaskStatus {
 /** A persisted ms timestamp, kept only when it is a usable finite number. */
 function optionalInstant(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+/**
+ * Repair the recorded-warning list: an entry without a usable id, instant,
+ * code or message is dropped instead of costing the card, and the list keeps
+ * only its newest {@link TASK_WARNING_LIMIT} entries.
+ * @param value - the persisted field, of unknown shape.
+ * @returns the repaired list, or undefined when nothing survives.
+ */
+function normalizeWarnings(value: unknown): TaskWarning[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const repaired: TaskWarning[] = []
+  for (const entry of value) {
+    if (typeof entry !== 'object' || entry === null) continue
+    const row = entry as Record<string, unknown>
+    const id = normalizeTargetId(row.id)
+    const code = normalizeTargetId(row.code)
+    const executionId = normalizeTargetId(row.executionId)
+    const message = typeof row.message === 'string' ? row.message.trim() : ''
+    const detail = typeof row.detail === 'string' ? row.detail.trim() : ''
+    const at = typeof row.at === 'number' && Number.isFinite(row.at) ? row.at : undefined
+    if (id === undefined || code === undefined || message === '' || at === undefined) continue
+    repaired.push({
+      id,
+      at,
+      code,
+      message,
+      ...(executionId === undefined ? {} : { executionId }),
+      ...(detail === '' ? {} : { detail }),
+    })
+  }
+  if (repaired.length === 0) return undefined
+  return repaired.length <= TASK_WARNING_LIMIT ? repaired : repaired.slice(repaired.length - TASK_WARNING_LIMIT)
 }
 
 /** A persisted positive-integer run cap, or undefined for unlimited/repair. */
@@ -288,6 +321,10 @@ export function parseLedger(raw: string | null): TaskRecord[] {
     task.permissionConfirmedAt = typeof row.permissionConfirmedAt === 'number' && Number.isFinite(row.permissionConfirmedAt) ? row.permissionConfirmedAt : undefined
     task.integrations = normalizeTaskIntegrations(row.integrations)
     task.hidden = row.hidden === true ? true : undefined
+    // Recorded discrepancies are repaired entry by entry: one unusable note
+    // is dropped rather than costing the card, and a list that repairs to
+    // nothing clears the field.
+    task.warnings = normalizeWarnings(row.warnings)
     tasks.push(task)
   }
   return tasks

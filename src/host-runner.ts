@@ -14,16 +14,58 @@ export interface TaskBoardWorkspaceRegistry {
   list(): readonly Workspace[]
 }
 
+/**
+ * An in-process Host call is a Remote call, and DSH's gateway requires a Peer
+ * on EVERY one of them (`InvokeRemoteRequest.peer` is non-optional: "every
+ * carrier and in-process caller names it explicitly"). Omit it and the gateway
+ * dereferences `peer.signal` on an undefined peer, so the call fails with a
+ * bare `Cannot read properties of undefined (reading 'signal')` that carries no
+ * `code` for any caller to classify.
+ *
+ * This board speaks for the Host process itself, so its Peer is an owner
+ * principal created once per runner under the reading context and reused for
+ * the runner's lifetime: minting one per call would leak a live scope per RPC.
+ */
+export interface TaskBoardPeerSource {
+  /**
+   * Create one in-process Peer owned by this source's Context.
+   * @param options.principal - caller identity, fixed at creation.
+   * @returns the Peer scope the gateway accepts on every request.
+   */
+  createPeer(options: { readonly principal: { readonly kind: 'owner' } }): TaskBoardPeer
+}
+
+/** The subset of a Peer scope the gateway reads on a request. */
+export interface TaskBoardPeer {
+  readonly signal: AbortSignal
+}
+
 interface GatewayRequest {
   namespace: string
   method: string
   args: Record<string, unknown>
   signal?: AbortSignal
+  /**
+   * Peer this call speaks for. Absent only for a gateway implementation that
+   * needs none (the test doubles); a real DSH gateway refuses a peerless call.
+   */
+  peer?: TaskBoardPeer
 }
 
 interface SessionGateway {
   invoke(request: GatewayRequest): Promise<unknown>
   stream?(request: GatewayRequest): Promise<AsyncIterable<unknown>>
+}
+
+/**
+ * The plain text of a thrown value, bounded so a note on a card never carries
+ * an unbounded stack.
+ * @param error - the thrown value.
+ * @returns its message, truncated to a readable length.
+ */
+function errorText(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error)
+  return text.length <= 300 ? text : text.slice(0, 300) + '…'
 }
 
 function sessionAddress(sessionId: string): SessionAddress {
@@ -373,24 +415,47 @@ export class HostExecutionRunner {
   private readonly unavailableBackoffMs: number
   private unsupportedSessionListWarned = false
 
+  /**
+   * The Peer every Remote call from this runner speaks for: an owner
+   * principal created once, so a call can never reach the gateway without one.
+   */
+  private readonly peer: TaskBoardPeer | undefined
+
   constructor(
     private readonly gateway: SessionGateway | TypertGateway,
     private readonly commands?: SessionCommandDispatcher,
     private readonly workspaceRegistry?: TaskBoardWorkspaceRegistry,
     unavailableRetry?: { attempts?: number; backoffMs?: number },
     private readonly workspaceGuard?: TaskBoardWorkspaceGuard,
+    peerSource?: TaskBoardPeerSource,
   ) {
     this.unavailableAttempts = unavailableRetry?.attempts ?? SERVICE_UNAVAILABLE_ATTEMPTS
     this.unavailableBackoffMs = unavailableRetry?.backoffMs ?? SERVICE_UNAVAILABLE_BACKOFF_MS
+    // Minted once, here: a Peer is a live scope, so one per call would leak one
+    // per RPC. A deployment that exposes no connection service (the test
+    // doubles) leaves it undefined and the gateway is called exactly as before.
+    this.peer = peerSource?.createPeer({ principal: { kind: 'owner' } })
   }
 
   private invoke(namespace: string, method: string, request: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
-    return this.gateway.invoke({ namespace, method, args: invokeWireArgs(namespace, method, request), ...(signal === undefined ? {} : { signal }) })
+    return this.gateway.invoke({
+      namespace,
+      method,
+      args: invokeWireArgs(namespace, method, request),
+      ...(signal === undefined ? {} : { signal }),
+      ...(this.peer === undefined ? {} : { peer: this.peer }),
+    })
   }
 
   private stream(namespace: string, method: string, request: Record<string, unknown>, signal?: AbortSignal): Promise<AsyncIterable<unknown>> {
     if (!('stream' in this.gateway) || this.gateway.stream === undefined) throw new Error('gateway stream is unavailable')
-    return this.gateway.stream({ namespace, method, args: { request }, ...(signal === undefined ? {} : { signal }) })
+    return this.gateway.stream({
+      namespace,
+      method,
+      args: { request },
+      ...(signal === undefined ? {} : { signal }),
+      ...(this.peer === undefined ? {} : { peer: this.peer }),
+    })
   }
 
   /**
@@ -695,7 +760,22 @@ export class HostExecutionRunner {
     return undefined
   }
 
-  async listRunning(): Promise<{ known: true; count: number; items: SessionSummary[] } | { known: false }> {
+  /**
+   * Read the Host session roster.
+   *
+   * NEVER throws: an unknown roster is a degraded read, not a failed launch.
+   * Only a transient `service-unavailable` is retried; every other failure is
+   * reported as `known: false` WITH the reason, so the caller can record it on
+   * the card instead of turning a read it could not classify into a dead run.
+   * A failure that carries no gateway `code` at all (a plain TypeError from a
+   * broken contract) is exactly that case, and it is why this method must not
+   * let an unclassifiable error escape to a caller that settles the card.
+   * @returns the roster, or `known: false` plus the reason it could not be read.
+   */
+  async listRunning(): Promise<
+    | { known: true; count: number; items: SessionSummary[] }
+    | { known: false; reason: string; detail?: string }
+  > {
     for (let attempt = 1; ; attempt++) {
       try {
         const response = await this.invoke('session', 'list', {}) as SessionListValue
@@ -706,18 +786,18 @@ export class HostExecutionRunner {
             this.unsupportedSessionListWarned = true
             console.warn('[dsh-task-board] DSH runtime session endpoint unavailable (requires DSH >= 0.1.2-alpha.2); task board roster auto-discovery is disabled', error)
           }
-          return { known: false }
+          return { known: false, reason: 'session endpoint unavailable', detail: errorText(error) }
         }
         if (isDefinitionWithdrawn(error)) {
           if (!this.unsupportedSessionListWarned) {
             this.unsupportedSessionListWarned = true
             console.warn('[dsh-task-board] the host gateway withdrew the session/list definition for this DSH cohort; task board roster auto-discovery is disabled', error)
           }
-          return { known: false }
+          return { known: false, reason: 'session/list definition withdrawn', detail: errorText(error) }
         }
         if (!isServiceUnavailable(error) || attempt >= this.unavailableAttempts) {
           console.error('[dsh-task-board] session/list failed; treating the host session roster as unknown', error)
-          return { known: false }
+          return { known: false, reason: 'session/list failed', detail: errorText(error) }
         }
         await delay(this.unavailableBackoffMs)
       }
